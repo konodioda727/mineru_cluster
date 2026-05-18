@@ -1091,6 +1091,15 @@ class RemoteWorkerPool:
                     options=[
                         ("grpc.max_receive_message_length", DEFAULT_MAX_MESSAGE_BYTES),
                         ("grpc.max_send_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+                        # Keep the long-running scheduler→worker connection alive through
+                        # NAT/firewall devices that drop idle TCP sessions. Workers can
+                        # process for minutes; without these pings the connection is silent
+                        # for that entire duration and any stateful network device will
+                        # drop it, producing "recvmsg:Connection timed out" on the response.
+                        ("grpc.keepalive_time_ms", DEFAULT_KEEPALIVE_TIME_MS),
+                        ("grpc.keepalive_timeout_ms", DEFAULT_KEEPALIVE_TIMEOUT_MS),
+                        ("grpc.keepalive_permit_without_calls", int(DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS)),
+                        ("grpc.http2.max_pings_without_data", DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA),
                     ],
                 ) as channel:
                     stub = mineru_pb2_grpc.MineruPdfExtractorStub(channel)
