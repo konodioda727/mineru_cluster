@@ -1,0 +1,72 @@
+[01:01:25] Installing runtime dependencies
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: pip in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (26.0.1)
+Requirement already satisfied: setuptools in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (82.0.1)
+Requirement already satisfied: wheel in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (0.46.3)
+Requirement already satisfied: packaging>=24.0 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from wheel) (26.0)
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: grpcio in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.78.0)
+Requirement already satisfied: grpcio-tools in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.78.0)
+Requirement already satisfied: pymupdf in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.27.2.2)
+Requirement already satisfied: typing-extensions~=4.12 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio) (4.15.0)
+Requirement already satisfied: protobuf<7.0.0,>=6.31.1 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio-tools) (6.33.6)
+Requirement already satisfied: setuptools>=77.0.1 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio-tools) (82.0.1)
+[01:01:28] Generating gRPC stubs from /Users/kb/mineru/mineru.proto
+[01:01:28] Loading env from /Users/kb/mineru/.env
+[01:01:28] Starting MinerU gRPC server with config:
+[01:01:28]   MINERU_SERVER_PORT=50051
+[01:01:28]   MINERU_SERVER_MAX_WORKERS=3
+[01:01:28]   MINERU_SERVER_CHUNK_SIZE=auto
+[01:01:28]   MINERU_SERVER_BACKEND=pipeline
+[01:01:28]   MINERU_SERVER_METHOD=auto
+[01:01:28]   MINERU_SERVER_DEVICE=mps
+[01:01:28]   MINERU_SERVER_FORMULA_ENABLE=false
+[01:01:28]   MINERU_SERVER_TABLE_ENABLE=true
+[01:01:28]   MINERU_SERVER_TABLE_MERGE_ENABLE=true
+[01:01:28]   MINERU_SERVER_MAX_MESSAGE_BYTES=268435456
+[main] MinerU gRPC server listening on :50051 (chunk_size=auto, max_workers=3, backend=pipeline, method=auto, device=mps, formula_enable=False, table_enable=True, table_merge_enable=True, min_merged_text_len=20)
+[03:06:45] Installing runtime dependencies
+./startup.sh: line 44: python: command not found
+[03:07:57] Installing runtime dependencies
+./startup.sh: line 44: python: command not found
+[03:10:38] Installing runtime dependencies
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: pip in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (26.0.1)
+Requirement already satisfied: setuptools in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (82.0.1)
+Requirement already satisfied: wheel in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (0.46.3)
+Requirement already satisfied: packaging>=24.0 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from wheel) (26.0)
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: grpcio in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.78.0)
+Requirement already satisfied: grpcio-tools in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.78.0)
+Requirement already satisfied: pymupdf in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (1.27.2.2)
+Requirement already satisfied: typing-extensions~=4.12 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio) (4.15.0)
+Requirement already satisfied: protobuf<7.0.0,>=6.31.1 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio-tools) (6.33.6)
+Requirement already satisfied: setuptools>=77.0.1 in /Users/kb/translation_rpc/.venv/lib/python3.14/site-packages (from grpcio-tools) (82.0.1)
+[03:10:41] Generating gRPC stubs from /Users/kb/mineru/mineru.proto
+[03:10:41] Loading env from /Users/kb/mineru/.env
+[03:10:41] Starting MinerU gRPC server with config:
+[03:10:41]   MINERU_SERVER_PORT=50051
+[03:10:41]   MINERU_SERVER_MAX_WORKERS=3
+[03:10:41]   MINERU_SERVER_CHUNK_SIZE=auto
+[03:10:41]   MINERU_SERVER_BACKEND=pipeline
+[03:10:41]   MINERU_SERVER_METHOD=auto
+[03:10:41]   MINERU_SERVER_DEVICE=mps
+[03:10:41]   MINERU_SERVER_FORMULA_ENABLE=false
+[03:10:41]   MINERU_SERVER_TABLE_ENABLE=true
+[03:10:41]   MINERU_SERVER_TABLE_MERGE_ENABLE=true
+[03:10:41]   MINERU_SERVER_MAX_MESSAGE_BYTES=268435456
+[main] MinerU gRPC server listening on :50051 (chunk_size=auto, max_workers=3, backend=pipeline, method=auto, device=mps, formula_enable=False, table_enable=True, table_merge_enable=True, min_merged_text_len=20)
+[main] received file: hello.pdf
+[main] file bytes: 11589
+[main] temp_dir: /var/folders/ts/nzfl76bn7q9brmbz7gf70d0w0000gq/T/mineru-grpc-brolcupm
+[main] split strategy: total_pages=1, resolved_chunk_size=1, target_workers=1
+[main] total pages: 1, chunk_size: 1
+[main] launching 1 mineru worker processes for 1 chunks
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1774638677.917136 101720231 fork_posix.cc:71] Other threads are currently calling into gRPC, skipping fork() handlers
+I0000 00:00:1774638677.923920 101720231 fork_posix.cc:71] Other threads are currently calling into gRPC, skipping fork() handlers
+[chunk 0] start, original pages begin at 1
+[chunk 0] exec: mineru -p /var/folders/ts/nzfl76bn7q9brmbz7gf70d0w0000gq/T/mineru-grpc-brolcupm/chunk_0.pdf -o /var/folders/ts/nzfl76bn7q9brmbz7gf70d0w0000gq/T/mineru-grpc-brolcupm/output -b pipeline -m auto -d mps -f false -t true
+[main] crash: [Errno 2] No such file or directory: 'mineru'
+[main] preserved temp_dir for debugging: /var/folders/ts/nzfl76bn7q9brmbz7gf70d0w0000gq/T/mineru-grpc-brolcupm
+[main] temp_dir kept: /var/folders/ts/nzfl76bn7q9brmbz7gf70d0w0000gq/T/mineru-grpc-brolcupm

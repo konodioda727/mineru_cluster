@@ -1,0 +1,1224 @@
+#!/usr/bin/env python3
+"""Standalone MinerU gRPC server.
+
+Requirements in the same directory:
+- mineru_pb2.py
+- mineru_pb2_grpc.py
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import json
+import math
+import multiprocessing as mp
+import os
+from pathlib import Path
+import queue
+import shutil
+import tempfile
+import threading
+import time
+import uuid
+import sys
+
+import fitz
+import grpc
+from loguru import logger
+
+import mineru_pb2
+import mineru_pb2_grpc
+
+from mineru.cli.common import _process_pipeline
+from mineru.utils.enum_class import MakeMode
+
+
+DEFAULT_PORT = int(os.getenv("MINERU_SERVER_PORT", "50051"))
+DEFAULT_MAX_WORKERS = int(os.getenv("MINERU_SERVER_MAX_WORKERS", "3"))
+DEFAULT_CHUNK_SIZE_RAW = (os.getenv("MINERU_SERVER_CHUNK_SIZE") or "").strip()
+DEFAULT_MAX_MESSAGE_BYTES = int(
+    os.getenv("MINERU_SERVER_MAX_MESSAGE_BYTES", str(256 * 1024 * 1024))
+)
+DEFAULT_GRPC_WORKERS = int(os.getenv("MINERU_SERVER_GRPC_WORKERS", "4"))
+DEFAULT_KEEPALIVE_TIME_MS = int(os.getenv("MINERU_SERVER_KEEPALIVE_TIME_MS", "60000"))
+DEFAULT_KEEPALIVE_TIMEOUT_MS = int(os.getenv("MINERU_SERVER_KEEPALIVE_TIMEOUT_MS", "20000"))
+DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS = (
+    (os.getenv("MINERU_SERVER_KEEPALIVE_PERMIT_WITHOUT_CALLS") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA = int(
+    os.getenv("MINERU_SERVER_HTTP2_MAX_PINGS_WITHOUT_DATA", "0")
+)
+DEFAULT_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS = int(
+    os.getenv("MINERU_SERVER_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS", "30000")
+)
+DEFAULT_HTTP2_MAX_PING_STRIKES = int(
+    os.getenv("MINERU_SERVER_HTTP2_MAX_PING_STRIKES", "0")
+)
+DEFAULT_MAX_CONNECTION_IDLE_MS = int(
+    os.getenv("MINERU_SERVER_MAX_CONNECTION_IDLE_MS", str(30 * 60 * 1000))
+)
+DEFAULT_MAX_CONNECTION_AGE_MS = int(
+    os.getenv("MINERU_SERVER_MAX_CONNECTION_AGE_MS", str(2 * 60 * 60 * 1000))
+)
+DEFAULT_MAX_CONNECTION_AGE_GRACE_MS = int(
+    os.getenv("MINERU_SERVER_MAX_CONNECTION_AGE_GRACE_MS", str(5 * 60 * 1000))
+)
+DEFAULT_BACKEND = (os.getenv("MINERU_SERVER_BACKEND") or "pipeline").strip()
+DEFAULT_METHOD = (os.getenv("MINERU_SERVER_METHOD") or "auto").strip()
+DEFAULT_LANG = (os.getenv("MINERU_SERVER_LANG") or "ch").strip()
+DEFAULT_DEVICE = (os.getenv("MINERU_SERVER_DEVICE") or "mps").strip()
+DEFAULT_ROLE = (os.getenv("MINERU_SERVER_ROLE") or "standalone").strip().lower()
+DEFAULT_EXECUTION_MODE = (os.getenv("MINERU_SERVER_EXECUTION_MODE") or "").strip().lower()
+DEFAULT_WORKER_PROCESSES = int(os.getenv("MINERU_SERVER_WORKER_PROCESSES", "3"))
+DEFAULT_FORMULA_ENABLE = (os.getenv("MINERU_SERVER_FORMULA_ENABLE") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_TABLE_ENABLE = (os.getenv("MINERU_SERVER_TABLE_ENABLE") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_TABLE_MERGE_ENABLE = (
+    (os.getenv("MINERU_SERVER_TABLE_MERGE_ENABLE") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEFAULT_KEEP_TEMP_DIR = (os.getenv("MINERU_SERVER_KEEP_TEMP_DIR") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_MIN_MERGED_TEXT_LEN = int(os.getenv("MINERU_SERVER_MIN_MERGED_TEXT_LEN", "20"))
+DEFAULT_MINERU_CLI = (os.getenv("MINERU_CLI") or "mineru").strip()
+DEFAULT_REQUEST_CONCURRENCY = int(
+    os.getenv("MINERU_SERVER_REQUEST_CONCURRENCY", str(max(1, DEFAULT_WORKER_PROCESSES)))
+)
+DEFAULT_PREWARM_ENABLED = (os.getenv("MINERU_SERVER_PREWARM") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_PREWARM_METHOD = (os.getenv("MINERU_SERVER_PREWARM_METHOD") or "ocr").strip().lower()
+DEFAULT_PREWARM_LANG = (os.getenv("MINERU_SERVER_PREWARM_LANG") or DEFAULT_LANG).strip()
+DEFAULT_LOG_MODE = (os.getenv("MINERU_SERVER_LOG_MODE") or "concise").strip().lower()
+DEFAULT_REMOTE_WORKERS = tuple(
+    item.strip()
+    for item in (os.getenv("MINERU_REMOTE_WORKERS") or "").split(",")
+    if item.strip()
+)
+DEFAULT_REMOTE_TIMEOUT_SECONDS = float(os.getenv("MINERU_REMOTE_TIMEOUT_SECONDS", "7200"))
+VERTICAL_TRADITIONAL_CHUNK_SIZE_RAW = (
+    os.getenv("MINERU_SERVER_VERTICAL_TRADITIONAL_CHUNK_SIZE") or ""
+).strip()
+VERTICAL_TRADITIONAL_METHOD = (
+    os.getenv("MINERU_SERVER_VERTICAL_TRADITIONAL_METHOD") or "ocr"
+).strip()
+VERTICAL_TRADITIONAL_LANG = (
+    os.getenv("MINERU_SERVER_VERTICAL_TRADITIONAL_LANG") or "chinese_cht"
+).strip()
+VERTICAL_TRADITIONAL_MIN_MERGED_TEXT_LEN = int(
+    os.getenv("MINERU_SERVER_VERTICAL_TRADITIONAL_MIN_MERGED_TEXT_LEN", "8")
+)
+
+
+@dataclass(frozen=True)
+class ParseProfile:
+    profile_name: str
+    method: str
+    lang: str
+    chunk_size_override: int | None
+    include_discarded_text: bool
+    reading_order: str
+    min_merged_text_len: int
+    merge_structured_blocks_upward: bool
+
+
+def resolve_vertical_traditional_chunk_size_override() -> int | None:
+    if not VERTICAL_TRADITIONAL_CHUNK_SIZE_RAW:
+        return None
+    try:
+        value = int(VERTICAL_TRADITIONAL_CHUNK_SIZE_RAW)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def log_event(stage: str, *, filename: str = "", task_id: str = "", worker_id: int | None = None, detail: str = "") -> None:
+    parts = [f"[{stage}]"]
+    if task_id:
+        parts.append(f"task={task_id}")
+    if worker_id is not None:
+        parts.append(f"worker={worker_id}")
+    if filename:
+        parts.append(f"file={filename}")
+    if detail:
+        parts.append(detail)
+    log(" ".join(parts))
+
+
+def configure_logging() -> None:
+    logger.remove()
+    if DEFAULT_LOG_MODE == "concise":
+        logger.add(sys.stderr, level="ERROR")
+    else:
+        logger.add(sys.stderr, level="INFO")
+
+
+def format_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def is_in_process_pipeline_enabled() -> bool:
+    if DEFAULT_EXECUTION_MODE in {"python", "inprocess", "in_process"}:
+        return True
+    if DEFAULT_EXECUTION_MODE == "cli":
+        return False
+    return DEFAULT_BACKEND == "pipeline"
+
+
+def is_scheduler_role() -> bool:
+    return DEFAULT_ROLE == "scheduler"
+
+
+def is_worker_role() -> bool:
+    return DEFAULT_ROLE == "worker"
+
+
+def is_standalone_role() -> bool:
+    return DEFAULT_ROLE in {"", "standalone"}
+
+
+def configure_mineru_runtime_env() -> None:
+    os.environ["MINERU_DEVICE_MODE"] = DEFAULT_DEVICE
+    os.environ["MINERU_FORMULA_ENABLE"] = format_bool(DEFAULT_FORMULA_ENABLE)
+    os.environ["MINERU_TABLE_ENABLE"] = format_bool(DEFAULT_TABLE_ENABLE)
+    os.environ["MINERU_TABLE_MERGE_ENABLE"] = format_bool(DEFAULT_TABLE_MERGE_ENABLE)
+
+
+def normalize_hint(value: str) -> str:
+    return (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def hint_has_any(value: str, keywords: set[str]) -> bool:
+    normalized = normalize_hint(value)
+    return any(keyword in normalized for keyword in keywords)
+
+
+def is_traditional_chinese_hint(value: str) -> bool:
+    normalized = normalize_hint(value)
+    return (
+        "繁体" in value
+        or "繁體" in value
+        or any(
+            keyword in normalized
+            for keyword in {"traditional", "cht", "chinese_cht", "zh_hant", "zh_tw", "zh_hk"}
+        )
+    )
+
+
+def is_vertical_layout_hint(value: str) -> bool:
+    normalized = normalize_hint(value)
+    return (
+        "竖排" in value
+        or "豎排" in value
+        or any(keyword in normalized for keyword in {"vertical", "vertical_rl", "vertical_book"})
+    )
+
+
+def normalize_mineru_lang(value: str) -> str:
+    raw = (value or "").strip()
+    normalized = normalize_hint(raw)
+    if not raw:
+        return DEFAULT_LANG
+
+    alias_map = {
+        "zh": "ch",
+        "zh_cn": "ch",
+        "zh_hans": "ch",
+        "zh_hant": "chinese_cht",
+        "zh_tw": "chinese_cht",
+        "zh_hk": "chinese_cht",
+        "zh_mo": "chinese_cht",
+        "traditional_chinese": "chinese_cht",
+        "simplified_chinese": "ch",
+        "chinese": "ch",
+        "chinese_cht": "chinese_cht",
+        "traditional": "chinese_cht",
+        "cht": "chinese_cht",
+        "jp": "japan",
+        "ja": "japan",
+        "ko": "korean",
+        "kr": "korean",
+        "en_us": "en",
+        "en_gb": "en",
+    }
+    if normalized in alias_map:
+        return alias_map[normalized]
+    if normalized.startswith("zh_hant"):
+        return "chinese_cht"
+    if normalized.startswith("zh_hans") or normalized.startswith("zh_cn"):
+        return "ch"
+    return raw
+
+
+def resolve_parse_profile(request: mineru_pb2.ParsePdfRequest) -> ParseProfile:
+    language_hint = request.language_hint or ""
+    layout_hint = request.layout_hint or ""
+    document_type_hint = request.document_type_hint or ""
+    model_version = request.model_version or ""
+
+    explicit_vertical_traditional = any(
+        hint_has_any(value, {"traditional_vertical", "vertical_traditional", "cht_vertical"})
+        for value in (layout_hint, document_type_hint, model_version)
+    )
+    vertical_traditional = explicit_vertical_traditional or (
+        is_traditional_chinese_hint(language_hint)
+        and (
+            is_vertical_layout_hint(layout_hint)
+            or is_vertical_layout_hint(document_type_hint)
+            or "古籍" in document_type_hint
+            or hint_has_any(document_type_hint, {"book"})
+        )
+    )
+
+    if vertical_traditional:
+        return ParseProfile(
+            profile_name="traditional_vertical_fine",
+            method=VERTICAL_TRADITIONAL_METHOD,
+            lang=VERTICAL_TRADITIONAL_LANG,
+            chunk_size_override=resolve_vertical_traditional_chunk_size_override(),
+            include_discarded_text=True,
+            reading_order="vertical_rl",
+            min_merged_text_len=max(1, VERTICAL_TRADITIONAL_MIN_MERGED_TEXT_LEN),
+            merge_structured_blocks_upward=False,
+        )
+
+    requested_method = normalize_hint(model_version)
+    if requested_method not in {"auto", "txt", "ocr"}:
+        requested_method = ""
+
+    requested_lang = normalize_mineru_lang(request.language_hint or "")
+
+    return ParseProfile(
+        profile_name="default",
+        method=requested_method or DEFAULT_METHOD,
+        lang=requested_lang,
+        chunk_size_override=None,
+        include_discarded_text=False,
+        reading_order="default",
+        min_merged_text_len=DEFAULT_MIN_MERGED_TEXT_LEN,
+        merge_structured_blocks_upward=True,
+    )
+
+
+def resolve_optional_chunk_size() -> int | None:
+    if not DEFAULT_CHUNK_SIZE_RAW:
+        return None
+    try:
+        value = int(DEFAULT_CHUNK_SIZE_RAW)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def resolve_chunk_size(total_pages: int, max_workers: int, manual_chunk_size: int | None) -> int:
+    if total_pages <= 0:
+        return 1
+    if manual_chunk_size is not None:
+        return max(1, min(total_pages, manual_chunk_size))
+    worker_count = max(1, min(total_pages, max_workers))
+    return max(1, math.ceil(total_pages / worker_count))
+
+
+def safe_bbox(raw_bbox: object) -> tuple[float, float, float, float]:
+    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+        return (0.0, 0.0, 0.0, 0.0)
+    try:
+        x0, y0, x1, y1 = (float(value) for value in raw_bbox)
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 0.0, 0.0)
+    return (x0, y0, x1, y1)
+
+
+def bbox_to_payload(raw_bbox: object) -> dict[str, float]:
+    x0, y0, x1, y1 = safe_bbox(raw_bbox)
+    return {
+        "x": x0,
+        "y": y0,
+        "width": max(0.0, x1 - x0),
+        "height": max(0.0, y1 - y0),
+    }
+
+
+def merge_bbox(base_bbox: dict[str, float] | None, incoming_bbox: dict[str, float] | None) -> dict[str, float] | None:
+    if base_bbox is None:
+        return incoming_bbox
+    if incoming_bbox is None:
+        return base_bbox
+    x0 = min(base_bbox["x"], incoming_bbox["x"])
+    y0 = min(base_bbox["y"], incoming_bbox["y"])
+    x1 = max(base_bbox["x"] + base_bbox["width"], incoming_bbox["x"] + incoming_bbox["width"])
+    y1 = max(base_bbox["y"] + base_bbox["height"], incoming_bbox["y"] + incoming_bbox["height"])
+    return {
+        "x": x0,
+        "y": y0,
+        "width": max(0.0, x1 - x0),
+        "height": max(0.0, y1 - y0),
+    }
+
+
+def normalize_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return "\n".join(parts).strip()
+    return str(value).strip()
+
+
+def join_non_empty(parts: list[str]) -> str:
+    return "\n".join(part for part in parts if part).strip()
+
+
+def flatten_table_text(item: dict) -> str:
+    return join_non_empty(
+        [
+            normalize_text(item.get("table_caption") or item.get("caption")),
+            normalize_text(item.get("table_footnote") or item.get("footnote")),
+            normalize_text(item.get("table_body") or item.get("html") or item.get("content")),
+        ]
+    )
+
+
+def flatten_list_text(item: dict) -> str:
+    return join_non_empty(
+        [
+            normalize_text(item.get("list_caption") or item.get("caption")),
+            normalize_text(
+                item.get("list_body")
+                or item.get("html")
+                or item.get("text")
+                or item.get("content")
+            ),
+        ]
+    )
+
+
+def append_block(
+    bucket: list[dict],
+    *,
+    text: str,
+    bbox: dict[str, float] | None,
+    bbox_source: str,
+) -> None:
+    bucket.append(
+        {
+            "text": text,
+            "bbox": bbox,
+            "bbox_source": bbox_source,
+        }
+    )
+
+
+def merge_upward_until_long_enough(
+    bucket: list[dict],
+    *,
+    text: str,
+    bbox: dict[str, float] | None,
+    merged_source: str,
+    min_text_len: int = DEFAULT_MIN_MERGED_TEXT_LEN,
+) -> None:
+    text = text.strip()
+    if not text:
+        return
+
+    if not bucket:
+        append_block(bucket, text=text, bbox=bbox, bbox_source=merged_source)
+        return
+
+    bucket[-1]["text"] = join_non_empty([bucket[-1]["text"], text])
+    bucket[-1]["bbox"] = merge_bbox(bucket[-1].get("bbox"), bbox)
+    bucket[-1]["bbox_source"] = merged_source
+
+    while len(str(bucket[-1].get("text") or "").strip()) < min_text_len and len(bucket) >= 2:
+        current = bucket.pop()
+        bucket[-1]["text"] = join_non_empty([bucket[-1]["text"], current["text"]])
+        bucket[-1]["bbox"] = merge_bbox(bucket[-1].get("bbox"), current.get("bbox"))
+        bucket[-1]["bbox_source"] = merged_source
+
+
+def sort_blocks_for_reading_order(blocks: list[dict], reading_order: str) -> list[dict]:
+    if reading_order == "vertical_rl":
+        return sorted(
+            blocks,
+            key=lambda block: (
+                -float((block.get("bbox") or {}).get("x", 0.0)),
+                float((block.get("bbox") or {}).get("y", 0.0)),
+                float((block.get("bbox") or {}).get("height", 0.0)),
+            ),
+        )
+    return sorted(
+        blocks,
+        key=lambda block: (
+            float((block.get("bbox") or {}).get("y", 0.0)),
+            float((block.get("bbox") or {}).get("x", 0.0)),
+        ),
+    )
+
+
+def load_chunk_pages(
+    chunk_path: str,
+    output_dir: str,
+    chunk_idx: int,
+    start_page_offset: int,
+    profile: ParseProfile,
+) -> list[dict]:
+    pdf_basename = Path(chunk_path).stem
+    base_result_dir = Path(output_dir) / pdf_basename
+    result_dirs = [
+        base_result_dir,
+        base_result_dir / profile.method,
+    ]
+    candidate_paths = [
+        path
+        for result_dir in result_dirs
+        for path in (
+            result_dir / f"{pdf_basename}_content_list.json",
+            result_dir / f"{pdf_basename}_middle.json",
+        )
+    ]
+    json_path = next((path for path in candidate_paths if path.exists()), None)
+    if json_path is None:
+        raise FileNotFoundError(
+            f"MinerU output json not found for chunk {chunk_idx} under {base_result_dir}; "
+            f"checked={[str(path) for path in candidate_paths]}"
+        )
+
+    with json_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    page_sizes = load_middle_page_sizes(output_dir, pdf_basename, profile.method)
+
+    if isinstance(payload, list):
+        content_items = payload
+    else:
+        content_items = payload.get("content_list") or []
+    if not content_items:
+        raise ValueError(
+            f"content_list is empty or missing for chunk {chunk_idx}; "
+            f"expected {pdf_basename}_content_list.json with text/table/list items"
+        )
+
+    page_buckets: dict[int, list[dict]] = {}
+    for item in content_items:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type") or "").strip().lower()
+        page_idx = int(item.get("page_idx") or 0)
+        bucket = page_buckets.setdefault(page_idx, [])
+        page_size = page_sizes[page_idx] if 0 <= page_idx < len(page_sizes) else {}
+        page_width = int(page_size.get("page_width") or 0)
+        page_height = int(page_size.get("page_height") or 0)
+        bbox = (
+            bbox_1000_to_page(item.get("bbox"), page_width, page_height)
+            if page_width > 0 and page_height > 0
+            else None
+        )
+
+        if item_type == "text":
+            text = normalize_text(item.get("text") or item.get("content"))
+            if not text:
+                continue
+            append_block(
+                bucket,
+                text=text,
+                bbox=bbox,
+                bbox_source="mineru_content_list_1000_mapped",
+            )
+            continue
+
+        if item_type == "table":
+            table_text = flatten_table_text(item)
+            if not table_text:
+                continue
+            if profile.merge_structured_blocks_upward:
+                merge_upward_until_long_enough(
+                    bucket,
+                    text=table_text,
+                    bbox=bbox,
+                    merged_source="mineru_content_list_table_1000_mapped",
+                    min_text_len=profile.min_merged_text_len,
+                )
+            else:
+                append_block(
+                    bucket,
+                    text=table_text,
+                    bbox=bbox,
+                    bbox_source="mineru_content_list_table_1000_mapped",
+                )
+            continue
+
+        if item_type == "list":
+            list_text = flatten_list_text(item)
+            if not list_text:
+                continue
+            if profile.merge_structured_blocks_upward:
+                merge_upward_until_long_enough(
+                    bucket,
+                    text=list_text,
+                    bbox=bbox,
+                    merged_source="mineru_content_list_list_1000_mapped",
+                    min_text_len=profile.min_merged_text_len,
+                )
+            else:
+                append_block(
+                    bucket,
+                    text=list_text,
+                    bbox=bbox,
+                    bbox_source="mineru_content_list_list_1000_mapped",
+                )
+            continue
+
+        if item_type == "discarded" and profile.include_discarded_text:
+            text = normalize_text(item.get("text") or item.get("content"))
+            if not text:
+                continue
+            append_block(
+                bucket,
+                text=text,
+                bbox=bbox,
+                bbox_source="mineru_discarded_1000_mapped",
+            )
+
+    pages: list[dict] = []
+    for page_idx in sorted(page_buckets):
+        pdf_page_no = start_page_offset + page_idx + 1
+        paragraphs: list[dict] = []
+        page_text_parts: list[str] = []
+
+        ordered_blocks = sort_blocks_for_reading_order(
+            page_buckets.get(page_idx, []),
+            profile.reading_order,
+        )
+        for paragraph_idx, block in enumerate(ordered_blocks, start=1):
+            text = str(block.get("text") or "").strip()
+            if not text:
+                continue
+
+            paragraphs.append(
+                {
+                    "paragraph_id": f"page-{pdf_page_no}-p{paragraph_idx}",
+                    "paragraph_no": paragraph_idx,
+                    "text": text,
+                    "bbox": block.get("bbox"),
+                    "bbox_source": str(block.get("bbox_source") or "mineru_content_list"),
+                }
+            )
+            page_text_parts.append(text)
+
+        page_size = page_sizes[page_idx] if 0 <= page_idx < len(page_sizes) else {}
+        pages.append(
+            {
+                "pdf_page_no": pdf_page_no,
+                "text": "\n".join(page_text_parts),
+                "paragraphs": paragraphs,
+                "page_width": int(page_size.get("page_width") or 0),
+                "page_height": int(page_size.get("page_height") or 0),
+            }
+        )
+
+    return pages
+
+
+def load_middle_page_sizes(output_dir: str, pdf_basename: str, method: str) -> list[dict[str, int]]:
+    base_result_dir = Path(output_dir) / pdf_basename
+    result_dirs = [
+        base_result_dir,
+        base_result_dir / method,
+    ]
+    candidate_paths = [
+        result_dir / f"{pdf_basename}_middle.json"
+        for result_dir in result_dirs
+    ]
+    middle_path = next((path for path in candidate_paths if path.exists()), None)
+    if middle_path is None:
+        raise FileNotFoundError(
+            f"MinerU middle json not found under {base_result_dir}; "
+            f"checked={[str(path) for path in candidate_paths]}"
+        )
+
+    with middle_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    pdf_info = payload.get("pdf_info") or []
+    page_sizes: list[dict[str, int]] = []
+    for page in pdf_info:
+        page_size = page.get("page_size") or [0, 0]
+        if not isinstance(page_size, (list, tuple)) or len(page_size) != 2:
+            page_sizes.append({"page_width": 0, "page_height": 0})
+            continue
+
+        try:
+            page_width = int(page_size[0] or 0)
+            page_height = int(page_size[1] or 0)
+        except (TypeError, ValueError):
+            page_width = 0
+            page_height = 0
+
+        page_sizes.append(
+            {
+                "page_width": max(0, page_width),
+                "page_height": max(0, page_height),
+            }
+        )
+    return page_sizes
+
+
+def bbox_1000_to_page(raw_bbox: object, page_width: int, page_height: int) -> dict[str, float]:
+    x0, y0, x1, y1 = safe_bbox(raw_bbox)
+    return {
+        "x": x0 / 1000.0 * page_width,
+        "y": y0 / 1000.0 * page_height,
+        "width": max(0.0, (x1 - x0) / 1000.0 * page_width),
+        "height": max(0.0, (y1 - y0) / 1000.0 * page_height),
+    }
+
+
+def split_pdf(pdf_path: str, chunk_size: int, temp_dir: str) -> list[dict]:
+    doc = fitz.open(pdf_path)
+    try:
+        total_pages = len(doc)
+        chunks: list[dict] = []
+
+        for start_page in range(0, total_pages, chunk_size):
+            end_page = min(start_page + chunk_size - 1, total_pages - 1)
+            chunk_idx = start_page // chunk_size
+            chunk_path = Path(temp_dir) / f"chunk_{chunk_idx}.pdf"
+
+            chunk_doc = fitz.open()
+            try:
+                chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page)
+                chunk_doc.save(chunk_path)
+            finally:
+                chunk_doc.close()
+
+            chunks.append(
+                {
+                    "path": str(chunk_path),
+                    "chunk_idx": chunk_idx,
+                    "start_page_offset": start_page,
+                }
+            )
+        return chunks
+    finally:
+        doc.close()
+
+
+def build_response(filename: str, all_pages_data: dict[int, list[dict]]) -> mineru_pb2.ParsePdfResponse:
+    response = mineru_pb2.ParsePdfResponse(task_id=f"mineru-job-{uuid.uuid4().hex[:8]}")
+    response.document.title = Path(filename).stem
+
+    full_text_parts: list[str] = []
+    paragraph_no_in_doc = 1
+
+    for chunk_idx in sorted(all_pages_data):
+        for page_dict in all_pages_data[chunk_idx]:
+            page = response.document.pages.add()
+            page.pdf_page_no = int(page_dict["pdf_page_no"])
+            page.text = str(page_dict.get("text") or "")
+            page.page_width = int(page_dict.get("page_width") or 0)
+            page.page_height = int(page_dict.get("page_height") or 0)
+
+            if page.text:
+                full_text_parts.append(page.text)
+
+            for paragraph_dict in page_dict.get("paragraphs", []):
+                paragraph = response.document.pages[-1].paragraphs.add()
+                paragraph.paragraph_id = str(paragraph_dict["paragraph_id"])
+                paragraph.paragraph_no = int(paragraph_dict["paragraph_no"])
+                paragraph.paragraph_no_in_doc = paragraph_no_in_doc
+                paragraph.text = str(paragraph_dict["text"])
+                paragraph.bbox_source = str(
+                    paragraph_dict.get("bbox_source") or "mineru_content_list"
+                )
+
+                bbox = paragraph_dict.get("bbox")
+                if bbox:
+                    paragraph.bbox.x = float(bbox["x"])
+                    paragraph.bbox.y = float(bbox["y"])
+                    paragraph.bbox.width = float(bbox["width"])
+                    paragraph.bbox.height = float(bbox["height"])
+
+                paragraph_no_in_doc += 1
+
+    response.document.full_text = "\f".join(full_text_parts)
+    return response
+
+
+def process_pdf_request(filename: str, file_content: bytes, profile: ParseProfile) -> bytes:
+    temp_dir = tempfile.mkdtemp(prefix="mineru-grpc-")
+    preserve_temp_dir = DEFAULT_KEEP_TEMP_DIR
+    temp_root = Path(temp_dir)
+    pdf_path = temp_root / (filename or "input.pdf")
+    output_dir = temp_root / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        pdf_path.write_bytes(file_content)
+        with fitz.open(pdf_path) as input_doc:
+            total_pages = len(input_doc)
+
+        resolved_chunk_size = resolve_chunk_size(
+            total_pages,
+            DEFAULT_MAX_WORKERS,
+            profile.chunk_size_override or resolve_optional_chunk_size(),
+        )
+        chunks = split_pdf(str(pdf_path), resolved_chunk_size, temp_dir)
+        all_pages_data = process_chunks_in_process(chunks, str(output_dir), profile)
+        response = build_response(filename or "input.pdf", all_pages_data)
+        return response.SerializeToString()
+    except Exception:
+        preserve_temp_dir = True
+        raise
+    finally:
+        if not preserve_temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def process_chunks_in_process(
+    chunks: list[dict],
+    output_dir: str,
+    profile: ParseProfile,
+) -> dict[int, list[dict]]:
+    if not chunks:
+        return {}
+
+    configure_mineru_runtime_env()
+    pdf_file_names = [Path(chunk["path"]).stem for chunk in chunks]
+    pdf_bytes_list = [Path(chunk["path"]).read_bytes() for chunk in chunks]
+    lang_list = [profile.lang for _ in chunks]
+
+    _process_pipeline(
+        output_dir=output_dir,
+        pdf_file_names=pdf_file_names,
+        pdf_bytes_list=pdf_bytes_list,
+        p_lang_list=lang_list,
+        parse_method=profile.method,
+        p_formula_enable=DEFAULT_FORMULA_ENABLE,
+        p_table_enable=DEFAULT_TABLE_ENABLE,
+        f_draw_layout_bbox=False,
+        f_draw_span_bbox=False,
+        f_dump_md=False,
+        f_dump_middle_json=True,
+        f_dump_model_output=False,
+        f_dump_orig_pdf=False,
+        f_dump_content_list=True,
+        f_make_md_mode=MakeMode.MM_MD,
+    )
+
+    all_pages_data: dict[int, list[dict]] = {}
+    for chunk in chunks:
+        chunk_idx = int(chunk["chunk_idx"])
+        pages = load_chunk_pages(
+            chunk["path"],
+            output_dir,
+            chunk_idx,
+            int(chunk["start_page_offset"]),
+            profile,
+        )
+        all_pages_data[chunk_idx] = pages
+    return all_pages_data
+
+
+def build_prewarm_pdf_bytes() -> bytes:
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 96), "MinerU warmup page", fontsize=20)
+        page.insert_text(
+            (72, 136),
+            "This startup warmup primes layout, OCR, and table-related runtime initialization.",
+            fontsize=12,
+        )
+        page.insert_text((72, 176), "A  B  C", fontsize=12)
+        page.insert_text((72, 206), "1  alpha  beta", fontsize=12)
+        page.insert_text((72, 236), "2  gamma  delta", fontsize=12)
+        for x in (68, 140, 250, 360):
+            page.draw_line((x, 160), (x, 255))
+        for y in (160, 190, 220, 255):
+            page.draw_line((68, y), (360, y))
+        return doc.write()
+    finally:
+        doc.close()
+
+
+def run_startup_prewarm() -> None:
+    if not DEFAULT_PREWARM_ENABLED:
+        log("[startup] prewarm disabled")
+        return
+    if not is_in_process_pipeline_enabled():
+        log("[startup] prewarm skipped because execution mode is CLI")
+        return
+
+    prewarm_method = DEFAULT_PREWARM_METHOD if DEFAULT_PREWARM_METHOD in {"auto", "txt", "ocr"} else "ocr"
+    configure_mineru_runtime_env()
+    warmup_dir = tempfile.mkdtemp(prefix="mineru-prewarm-")
+    started_at = time.time()
+    log(
+        f"[startup] prewarm begin (backend={DEFAULT_BACKEND}, method={prewarm_method}, "
+        f"lang={DEFAULT_PREWARM_LANG}, device={DEFAULT_DEVICE})"
+    )
+    try:
+        _process_pipeline(
+            output_dir=warmup_dir,
+            pdf_file_names=["warmup"],
+            pdf_bytes_list=[build_prewarm_pdf_bytes()],
+            p_lang_list=[DEFAULT_PREWARM_LANG],
+            parse_method=prewarm_method,
+            p_formula_enable=DEFAULT_FORMULA_ENABLE,
+            p_table_enable=DEFAULT_TABLE_ENABLE,
+            f_draw_layout_bbox=False,
+            f_draw_span_bbox=False,
+            f_dump_md=False,
+            f_dump_middle_json=False,
+            f_dump_model_output=False,
+            f_dump_orig_pdf=False,
+            f_dump_content_list=False,
+            f_make_md_mode=MakeMode.MM_MD,
+        )
+        log(f"[startup] prewarm complete in {time.time() - started_at:.1f}s")
+    finally:
+        shutil.rmtree(warmup_dir, ignore_errors=True)
+
+
+def worker_process_main(
+    worker_id: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+) -> None:
+    try:
+        configure_logging()
+        configure_mineru_runtime_env()
+        run_startup_prewarm()
+        result_queue.put({"type": "ready", "worker_id": worker_id})
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                return
+
+            task_id = str(task["task_id"])
+            filename = str(task["filename"])
+            profile = task["profile"]
+            try:
+                response_bytes = process_pdf_request(
+                    filename,
+                    task["file_content"],
+                    profile,
+                )
+                result_queue.put(
+                    {
+                        "type": "result",
+                        "worker_id": worker_id,
+                        "task_id": task_id,
+                        "response_bytes": response_bytes,
+                    }
+                )
+                log_event("completed", task_id=task_id, worker_id=worker_id, filename=filename)
+            except Exception as exc:
+                result_queue.put(
+                    {
+                        "type": "error",
+                        "worker_id": worker_id,
+                        "task_id": task_id,
+                        "error": str(exc),
+                    }
+                )
+                log_event("failed", task_id=task_id, worker_id=worker_id, filename=filename, detail=str(exc))
+    except Exception as exc:
+        result_queue.put(
+            {
+                "type": "startup_error",
+                "worker_id": worker_id,
+                "error": str(exc),
+            }
+        )
+        raise
+
+
+class WorkerManager:
+    def __init__(self, worker_count: int) -> None:
+        self.worker_count = max(1, worker_count)
+        self.task_queue: mp.Queue = mp.Queue()
+        self.result_queue: mp.Queue = mp.Queue()
+        self.processes: list[mp.Process] = []
+        self._pending: dict[str, queue.Queue] = {}
+        self._pending_lock = threading.Lock()
+        self._result_thread: threading.Thread | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        if self.processes:
+            return
+
+        for worker_id in range(self.worker_count):
+            process = mp.Process(
+                target=worker_process_main,
+                args=(worker_id, self.task_queue, self.result_queue),
+                name=f"mineru-worker-{worker_id}",
+            )
+            process.start()
+            message = self.result_queue.get()
+            if message.get("type") != "ready" or int(message.get("worker_id", -1)) != worker_id:
+                process.join(timeout=1)
+                raise RuntimeError(
+                    f"worker {worker_id} failed during startup: {message.get('error') or message}"
+                )
+            log(f"[startup] worker {worker_id} ready")
+            self.processes.append(process)
+
+        self._result_thread = threading.Thread(
+            target=self._result_loop,
+            name="mineru-worker-results",
+            daemon=True,
+        )
+        self._result_thread.start()
+
+    def _result_loop(self) -> None:
+        while not self._closed:
+            try:
+                message = self.result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception:
+                if self._closed:
+                    return
+                raise
+
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") not in {"result", "error"}:
+                continue
+
+            task_id = str(message.get("task_id") or "")
+            if not task_id:
+                continue
+            with self._pending_lock:
+                waiter = self._pending.pop(task_id, None)
+            if waiter is not None:
+                waiter.put(message)
+
+    def submit(
+        self,
+        *,
+        task_id: str,
+        filename: str,
+        file_content: bytes,
+        profile: ParseProfile,
+        timeout: float | None = None,
+    ) -> bytes:
+        waiter: queue.Queue = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[task_id] = waiter
+
+        self.task_queue.put(
+            {
+                "task_id": task_id,
+                "filename": filename,
+                "file_content": file_content,
+                "profile": profile,
+            }
+        )
+
+        try:
+            message = waiter.get(timeout=timeout)
+        except queue.Empty as exc:
+            with self._pending_lock:
+                self._pending.pop(task_id, None)
+            raise TimeoutError(f"worker timed out for task {task_id}") from exc
+
+        if message["type"] == "error":
+            raise RuntimeError(str(message.get("error") or "worker failed"))
+        return bytes(message["response_bytes"])
+
+    def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _ in self.processes:
+            self.task_queue.put(None)
+        for process in self.processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+        self.processes.clear()
+
+
+class RemoteWorkerPool:
+    def __init__(self, targets: tuple[str, ...]) -> None:
+        if not targets:
+            raise ValueError("MINERU_REMOTE_WORKERS is empty")
+        self.targets = targets
+        self._lock = threading.Lock()
+        self._next_index = 0
+
+    def _next_target_order(self) -> list[str]:
+        with self._lock:
+            start_index = self._next_index
+            self._next_index = (self._next_index + 1) % len(self.targets)
+        return [self.targets[(start_index + offset) % len(self.targets)] for offset in range(len(self.targets))]
+
+    def submit(self, request: mineru_pb2.ParsePdfRequest) -> mineru_pb2.ParsePdfResponse:
+        last_error: Exception | None = None
+        for target in self._next_target_order():
+            try:
+                with grpc.insecure_channel(
+                    target,
+                    options=[
+                        ("grpc.max_receive_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+                        ("grpc.max_send_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+                    ],
+                ) as channel:
+                    stub = mineru_pb2_grpc.MineruPdfExtractorStub(channel)
+                    return stub.ParsePdf(request, timeout=DEFAULT_REMOTE_TIMEOUT_SECONDS)
+            except grpc.RpcError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise RuntimeError(f"all remote workers failed: {last_error}") from last_error
+        raise RuntimeError("all remote workers failed")
+
+
+class MineruService(mineru_pb2_grpc.MineruPdfExtractorServicer):
+    def __init__(
+        self,
+        worker_manager: WorkerManager | None = None,
+        remote_worker_pool: RemoteWorkerPool | None = None,
+    ) -> None:
+        self._request_slots = threading.Semaphore(max(1, DEFAULT_REQUEST_CONCURRENCY))
+        self._worker_manager = worker_manager
+        self._remote_worker_pool = remote_worker_pool
+
+    def ParsePdf(self, request: mineru_pb2.ParsePdfRequest, context: grpc.ServicerContext) -> mineru_pb2.ParsePdfResponse:
+        self._request_slots.acquire()
+        task_id = uuid.uuid4().hex[:12]
+        filename = request.filename or "input.pdf"
+        log_event("received", task_id=task_id, filename=filename)
+        profile = resolve_parse_profile(request)
+
+        try:
+            try:
+                if self._remote_worker_pool is not None:
+                    response = self._remote_worker_pool.submit(request)
+                elif is_in_process_pipeline_enabled() and self._worker_manager is not None:
+                    response_bytes = self._worker_manager.submit(
+                        task_id=task_id,
+                        filename=filename,
+                        file_content=request.file_content,
+                        profile=profile,
+                    )
+                    response = mineru_pb2.ParsePdfResponse()
+                    response.ParseFromString(response_bytes)
+                else:
+                    raise RuntimeError(
+                        "worker manager is not available; set MINERU_SERVER_BACKEND=pipeline "
+                        "or MINERU_SERVER_EXECUTION_MODE=python"
+                    )
+            except Exception as exc:
+                log_event("failed", task_id=task_id, filename=filename, detail=str(exc))
+                context.abort(grpc.StatusCode.INTERNAL, str(exc))
+
+            log_event("returned", task_id=task_id, filename=filename)
+            return response
+        finally:
+            self._request_slots.release()
+
+
+def serve() -> None:
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    configure_logging()
+    configure_mineru_runtime_env()
+    worker_manager: WorkerManager | None = None
+    remote_worker_pool: RemoteWorkerPool | None = None
+
+    if is_scheduler_role():
+        remote_worker_pool = RemoteWorkerPool(DEFAULT_REMOTE_WORKERS)
+    else:
+        worker_manager = WorkerManager(DEFAULT_WORKER_PROCESSES)
+        worker_manager.start()
+
+    server = grpc.server(
+        ThreadPoolExecutor(max_workers=DEFAULT_GRPC_WORKERS),
+        options=[
+            ("grpc.max_receive_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+            ("grpc.keepalive_time_ms", DEFAULT_KEEPALIVE_TIME_MS),
+            ("grpc.keepalive_timeout_ms", DEFAULT_KEEPALIVE_TIMEOUT_MS),
+            ("grpc.keepalive_permit_without_calls", int(DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS)),
+            ("grpc.http2.max_pings_without_data", DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA),
+            (
+                "grpc.http2.min_ping_interval_without_data_ms",
+                DEFAULT_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS,
+            ),
+            ("grpc.http2.max_ping_strikes", DEFAULT_HTTP2_MAX_PING_STRIKES),
+            ("grpc.max_connection_idle_ms", DEFAULT_MAX_CONNECTION_IDLE_MS),
+            ("grpc.max_connection_age_ms", DEFAULT_MAX_CONNECTION_AGE_MS),
+            ("grpc.max_connection_age_grace_ms", DEFAULT_MAX_CONNECTION_AGE_GRACE_MS),
+        ],
+    )
+    mineru_pb2_grpc.add_MineruPdfExtractorServicer_to_server(
+        MineruService(worker_manager, remote_worker_pool),
+        server,
+    )
+    server.add_insecure_port(f"[::]:{DEFAULT_PORT}")
+    log(
+        f"[main] MinerU gRPC server listening on :{DEFAULT_PORT} "
+        f"(chunk_size={'auto' if resolve_optional_chunk_size() is None else resolve_optional_chunk_size()}, "
+        f"role={DEFAULT_ROLE or 'standalone'}, "
+        f"max_workers={DEFAULT_MAX_WORKERS}, backend={DEFAULT_BACKEND}, method={DEFAULT_METHOD}, "
+        f"execution_mode={'python' if is_in_process_pipeline_enabled() else 'cli'}, "
+        f"worker_processes={max(1, DEFAULT_WORKER_PROCESSES)}, "
+        f"remote_workers={len(DEFAULT_REMOTE_WORKERS)}, "
+        f"device={DEFAULT_DEVICE}, formula_enable={DEFAULT_FORMULA_ENABLE}, "
+        f"table_enable={DEFAULT_TABLE_ENABLE}, table_merge_enable={DEFAULT_TABLE_MERGE_ENABLE}, "
+        f"request_concurrency={max(1, DEFAULT_REQUEST_CONCURRENCY)}, "
+        f"prewarm={DEFAULT_PREWARM_ENABLED}, "
+        f"min_merged_text_len={DEFAULT_MIN_MERGED_TEXT_LEN}, "
+        f"keepalive_time_ms={DEFAULT_KEEPALIVE_TIME_MS}, "
+        f"keepalive_timeout_ms={DEFAULT_KEEPALIVE_TIMEOUT_MS}, "
+        f"keepalive_permit_without_calls={DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS}, "
+        f"http2_max_pings_without_data={DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA}, "
+        f"http2_min_ping_interval_without_data_ms={DEFAULT_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS}, "
+        f"http2_max_ping_strikes={DEFAULT_HTTP2_MAX_PING_STRIKES}, "
+        f"max_connection_idle_ms={DEFAULT_MAX_CONNECTION_IDLE_MS}, "
+        f"max_connection_age_ms={DEFAULT_MAX_CONNECTION_AGE_MS}, "
+        f"max_connection_age_grace_ms={DEFAULT_MAX_CONNECTION_AGE_GRACE_MS})"
+    )
+    server.start()
+    try:
+        server.wait_for_termination()
+    finally:
+        if worker_manager is not None:
+            worker_manager.stop()
+
+
+if __name__ == "__main__":
+    serve()
