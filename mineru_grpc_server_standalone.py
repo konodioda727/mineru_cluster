@@ -40,7 +40,50 @@ DEFAULT_CHUNK_SIZE_RAW = (os.getenv("MINERU_SERVER_CHUNK_SIZE") or "").strip()
 DEFAULT_MAX_MESSAGE_BYTES = int(
     os.getenv("MINERU_SERVER_MAX_MESSAGE_BYTES", str(256 * 1024 * 1024))
 )
-DEFAULT_GRPC_WORKERS = int(os.getenv("MINERU_SERVER_GRPC_WORKERS", "4"))
+
+# Role / remote-worker topology — declared early so that GRPC_WORKERS and
+# REQUEST_CONCURRENCY can scale automatically in scheduler mode.
+DEFAULT_ROLE = (os.getenv("MINERU_SERVER_ROLE") or "standalone").strip().lower()
+DEFAULT_WORKER_PROCESSES = int(os.getenv("MINERU_SERVER_WORKER_PROCESSES", "3"))
+DEFAULT_REMOTE_WORKERS = tuple(
+    item.strip()
+    for item in (os.getenv("MINERU_REMOTE_WORKERS") or "").split(",")
+    if item.strip()
+)
+# How many concurrent jobs each remote worker node is expected to handle.
+# Scheduler uses this to size its own semaphore and gRPC thread pool so that
+# all worker capacity is actually utilised instead of being bottlenecked here.
+DEFAULT_REMOTE_WORKER_CONCURRENCY = int(
+    os.getenv("MINERU_REMOTE_WORKER_CONCURRENCY", str(DEFAULT_WORKER_PROCESSES))
+)
+
+
+def _scheduler_total_concurrency() -> int:
+    """Total concurrent slots when running as scheduler: nodes × per-node capacity."""
+    return max(1, len(DEFAULT_REMOTE_WORKERS) * DEFAULT_REMOTE_WORKER_CONCURRENCY)
+
+
+def _default_grpc_workers() -> int:
+    explicit = (os.getenv("MINERU_SERVER_GRPC_WORKERS") or "").strip()
+    if explicit:
+        return max(1, int(explicit))
+    if DEFAULT_ROLE == "scheduler" and DEFAULT_REMOTE_WORKERS:
+        # Extra headroom so that threads waiting on a semaphore don't block
+        # incoming requests from getting a handler thread.
+        return _scheduler_total_concurrency() + 4
+    return 4
+
+
+def _default_request_concurrency() -> int:
+    explicit = (os.getenv("MINERU_SERVER_REQUEST_CONCURRENCY") or "").strip()
+    if explicit:
+        return max(1, int(explicit))
+    if DEFAULT_ROLE == "scheduler" and DEFAULT_REMOTE_WORKERS:
+        return _scheduler_total_concurrency()
+    return max(1, DEFAULT_WORKER_PROCESSES)
+
+
+DEFAULT_GRPC_WORKERS = _default_grpc_workers()
 DEFAULT_KEEPALIVE_TIME_MS = int(os.getenv("MINERU_SERVER_KEEPALIVE_TIME_MS", "60000"))
 DEFAULT_KEEPALIVE_TIMEOUT_MS = int(os.getenv("MINERU_SERVER_KEEPALIVE_TIMEOUT_MS", "20000"))
 DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS = (
@@ -69,9 +112,7 @@ DEFAULT_BACKEND = (os.getenv("MINERU_SERVER_BACKEND") or "pipeline").strip()
 DEFAULT_METHOD = (os.getenv("MINERU_SERVER_METHOD") or "auto").strip()
 DEFAULT_LANG = (os.getenv("MINERU_SERVER_LANG") or "ch").strip()
 DEFAULT_DEVICE = (os.getenv("MINERU_SERVER_DEVICE") or "mps").strip()
-DEFAULT_ROLE = (os.getenv("MINERU_SERVER_ROLE") or "standalone").strip().lower()
 DEFAULT_EXECUTION_MODE = (os.getenv("MINERU_SERVER_EXECUTION_MODE") or "").strip().lower()
-DEFAULT_WORKER_PROCESSES = int(os.getenv("MINERU_SERVER_WORKER_PROCESSES", "3"))
 DEFAULT_FORMULA_ENABLE = (os.getenv("MINERU_SERVER_FORMULA_ENABLE") or "false").strip().lower() in {
     "1",
     "true",
@@ -96,9 +137,7 @@ DEFAULT_KEEP_TEMP_DIR = (os.getenv("MINERU_SERVER_KEEP_TEMP_DIR") or "false").st
 }
 DEFAULT_MIN_MERGED_TEXT_LEN = int(os.getenv("MINERU_SERVER_MIN_MERGED_TEXT_LEN", "20"))
 DEFAULT_MINERU_CLI = (os.getenv("MINERU_CLI") or "mineru").strip()
-DEFAULT_REQUEST_CONCURRENCY = int(
-    os.getenv("MINERU_SERVER_REQUEST_CONCURRENCY", str(max(1, DEFAULT_WORKER_PROCESSES)))
-)
+DEFAULT_REQUEST_CONCURRENCY = _default_request_concurrency()
 DEFAULT_PREWARM_ENABLED = (os.getenv("MINERU_SERVER_PREWARM") or "true").strip().lower() in {
     "1",
     "true",
@@ -108,11 +147,6 @@ DEFAULT_PREWARM_ENABLED = (os.getenv("MINERU_SERVER_PREWARM") or "true").strip()
 DEFAULT_PREWARM_METHOD = (os.getenv("MINERU_SERVER_PREWARM_METHOD") or "ocr").strip().lower()
 DEFAULT_PREWARM_LANG = (os.getenv("MINERU_SERVER_PREWARM_LANG") or DEFAULT_LANG).strip()
 DEFAULT_LOG_MODE = (os.getenv("MINERU_SERVER_LOG_MODE") or "concise").strip().lower()
-DEFAULT_REMOTE_WORKERS = tuple(
-    item.strip()
-    for item in (os.getenv("MINERU_REMOTE_WORKERS") or "").split(",")
-    if item.strip()
-)
 DEFAULT_REMOTE_TIMEOUT_SECONDS = float(os.getenv("MINERU_REMOTE_TIMEOUT_SECONDS", "7200"))
 VERTICAL_TRADITIONAL_CHUNK_SIZE_RAW = (
     os.getenv("MINERU_SERVER_VERTICAL_TRADITIONAL_CHUNK_SIZE") or ""
