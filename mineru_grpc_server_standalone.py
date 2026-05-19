@@ -959,16 +959,11 @@ def _try_empty_torch_cache() -> None:
 def _worker_rss_gb() -> float:
     if sys.platform == "darwin":
         return _macos_phys_footprint_gb()
-    # Linux: read RSS from /proc/self/status (in kB)
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / (1024 ** 2)
-    except Exception:
-        pass
-    import resource
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / (1024 ** 2)
+    raise OSError("VmRSS not found in /proc/self/status")
 
 
 def _macos_phys_footprint_gb() -> float:
@@ -994,7 +989,7 @@ def _macos_phys_footprint_gb() -> float:
     info = _RUsageInfo()
     ret = libproc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(info))
     if ret != 0:
-        raise OSError(f"proc_pid_rusage failed with code {ret}")
+        raise OSError(f"proc_pid_rusage returned {ret}")
     return info.ri_phys_footprint / (1024 ** 3)
 
 
@@ -1057,8 +1052,13 @@ def worker_process_main(
             _try_empty_torch_cache()
 
             tasks_processed += 1
-            rss_gb = _worker_rss_gb()
-            log(f"[worker] worker {worker_id} task={tasks_processed+1} rss={rss_gb:.1f}GB limit={DEFAULT_MAX_WORKER_MEMORY_GB or 'disabled'}GB")
+            try:
+                rss_gb = _worker_rss_gb()
+            except Exception as exc:
+                log(f"[worker] worker {worker_id} memory check failed: {exc}, recycling to be safe")
+                result_queue.put({"type": "recycle", "worker_id": worker_id})
+                return
+            log(f"[worker] worker {worker_id} task={tasks_processed} rss={rss_gb:.1f}GB limit={DEFAULT_MAX_WORKER_MEMORY_GB or 'disabled'}GB")
             if DEFAULT_MAX_WORKER_MEMORY_GB > 0 and rss_gb >= DEFAULT_MAX_WORKER_MEMORY_GB:
                 log_event("recycling", worker_id=worker_id, detail=f"memory limit reached: {rss_gb:.1f}GB >= {DEFAULT_MAX_WORKER_MEMORY_GB}GB")
                 result_queue.put({"type": "recycle", "worker_id": worker_id})
