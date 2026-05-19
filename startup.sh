@@ -64,8 +64,15 @@ setup_venv() {
 
   if [[ "${AUTO_INSTALL}" == "1" ]]; then
     log "Installing runtime dependencies"
-    "${MINERU_PYTHON_BIN}" -m pip install -U pip setuptools wheel
-    "${MINERU_PYTHON_BIN}" -m pip install -U grpcio grpcio-tools pymupdf torch mineru
+    "${MINERU_PYTHON_BIN}" -m pip install -U pip wheel
+
+    # Install mineru first so it can pin its own torch/paddle versions.
+    # Do NOT pass -U here: mineru has tight version constraints on torch and
+    # paddlepaddle; force-upgrading them independently breaks the pipeline.
+    "${MINERU_PYTHON_BIN}" -m pip install mineru
+
+    # gRPC and PDF deps: upgrade is safe because they're independent of MinerU's ML stack.
+    "${MINERU_PYTHON_BIN}" -m pip install -U grpcio grpcio-tools pymupdf
   fi
 }
 

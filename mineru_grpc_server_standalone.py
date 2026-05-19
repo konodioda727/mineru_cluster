@@ -1245,6 +1245,7 @@ class RemoteWorkerPool:
                     return stub.ParsePdf(request, timeout=DEFAULT_REMOTE_TIMEOUT_SECONDS)
             except grpc.RpcError as exc:
                 last_error = exc
+                log(f"[scheduler] worker {target} failed, trying next: {exc.code()} {exc.details()}")
                 continue
         if last_error is not None:
             raise RuntimeError(f"all remote workers failed: {last_error}") from last_error
