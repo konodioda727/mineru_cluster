@@ -957,15 +957,12 @@ def _try_empty_torch_cache() -> None:
 
 
 def _worker_rss_gb() -> float:
-    try:
-        import resource
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
-        if sys.platform == "darwin":
-            return usage.ru_maxrss / (1024 ** 3)
-        return usage.ru_maxrss / (1024 ** 2)
-    except Exception:
-        return 0.0
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
+    if sys.platform == "darwin":
+        return usage.ru_maxrss / (1024 ** 3)
+    return usage.ru_maxrss / (1024 ** 2)
 
 
 def worker_process_main(
@@ -978,6 +975,7 @@ def worker_process_main(
         configure_logging()
         configure_mineru_runtime_env()
         run_startup_prewarm()
+        log(f"[worker] worker {worker_id} ready, memory_limit={DEFAULT_MAX_WORKER_MEMORY_GB or 'disabled'}GB, max_tasks={DEFAULT_MAX_TASKS_PER_WORKER or 'disabled'}")
         result_queue.put({"type": "ready", "worker_id": worker_id})
 
         tasks_processed = 0
@@ -1027,10 +1025,12 @@ def worker_process_main(
 
             tasks_processed += 1
             rss_gb = _worker_rss_gb()
+            log(f"[worker] worker {worker_id} task={tasks_processed+1} rss={rss_gb:.1f}GB limit={DEFAULT_MAX_WORKER_MEMORY_GB or 'disabled'}GB")
             if DEFAULT_MAX_WORKER_MEMORY_GB > 0 and rss_gb >= DEFAULT_MAX_WORKER_MEMORY_GB:
                 log_event("recycling", worker_id=worker_id, detail=f"memory limit reached: {rss_gb:.1f}GB >= {DEFAULT_MAX_WORKER_MEMORY_GB}GB")
                 result_queue.put({"type": "recycle", "worker_id": worker_id})
                 return
+            tasks_processed += 1
             if DEFAULT_MAX_TASKS_PER_WORKER > 0 and tasks_processed >= DEFAULT_MAX_TASKS_PER_WORKER:
                 log_event("recycling", worker_id=worker_id, detail=f"after {tasks_processed} tasks, rss={rss_gb:.1f}GB")
                 result_queue.put({"type": "recycle", "worker_id": worker_id})
