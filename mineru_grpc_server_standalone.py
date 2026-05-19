@@ -957,12 +957,27 @@ def _try_empty_torch_cache() -> None:
 
 
 def _worker_rss_gb() -> float:
-    import resource
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
-    if sys.platform == "darwin":
-        return usage.ru_maxrss / (1024 ** 3)
-    return usage.ru_maxrss / (1024 ** 2)
+    # CPU-side RSS
+    try:
+        import psutil
+        rss_bytes = psutil.Process().memory_info().rss
+    except Exception:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_bytes = usage.ru_maxrss if sys.platform != "darwin" else usage.ru_maxrss
+        if sys.platform != "darwin":
+            rss_bytes *= 1024  # Linux: KB → bytes
+    rss_gb = rss_bytes / (1024 ** 3)
+
+    # MPS GPU-side memory (unified memory, not visible to ru_maxrss)
+    try:
+        import torch
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            rss_gb += torch.mps.current_allocated_memory() / (1024 ** 3)
+    except Exception:
+        pass
+
+    return rss_gb
 
 
 def worker_process_main(
@@ -1231,43 +1246,59 @@ class RemoteWorkerPool:
             raise ValueError("MINERU_REMOTE_WORKERS is empty")
         self.targets = targets
         self._lock = threading.Lock()
-        self._next_index = 0
+        self._in_flight: dict[str, int] = {t: 0 for t in targets}
 
-    def _next_target_order(self) -> list[str]:
+    def _pick_target(self) -> str:
         with self._lock:
-            start_index = self._next_index
-            self._next_index = (self._next_index + 1) % len(self.targets)
-        return [self.targets[(start_index + offset) % len(self.targets)] for offset in range(len(self.targets))]
+            return min(self.targets, key=lambda t: self._in_flight[t])
+
+    def _fallback_order(self, exclude: str) -> list[str]:
+        with self._lock:
+            others = [t for t in self.targets if t != exclude]
+            return sorted(others, key=lambda t: self._in_flight[t])
 
     def submit(self, request: mineru_pb2.ParsePdfRequest) -> mineru_pb2.ParsePdfResponse:
-        last_error: Exception | None = None
-        for target in self._next_target_order():
-            try:
-                with grpc.insecure_channel(
-                    target,
-                    options=[
-                        ("grpc.max_receive_message_length", DEFAULT_MAX_MESSAGE_BYTES),
-                        ("grpc.max_send_message_length", DEFAULT_MAX_MESSAGE_BYTES),
-                        # Keep the long-running scheduler→worker connection alive through
-                        # NAT/firewall devices that drop idle TCP sessions. Workers can
-                        # process for minutes; without these pings the connection is silent
-                        # for that entire duration and any stateful network device will
-                        # drop it, producing "recvmsg:Connection timed out" on the response.
-                        ("grpc.keepalive_time_ms", DEFAULT_KEEPALIVE_TIME_MS),
-                        ("grpc.keepalive_timeout_ms", DEFAULT_KEEPALIVE_TIMEOUT_MS),
-                        ("grpc.keepalive_permit_without_calls", int(DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS)),
-                        ("grpc.http2.max_pings_without_data", DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA),
-                    ],
-                ) as channel:
-                    stub = mineru_pb2_grpc.MineruPdfExtractorStub(channel)
-                    return stub.ParsePdf(request, timeout=DEFAULT_REMOTE_TIMEOUT_SECONDS)
-            except grpc.RpcError as exc:
-                last_error = exc
-                log(f"[scheduler] worker {target} failed, trying next: {exc.code()} {exc.details()}")
-                continue
-        if last_error is not None:
+        target = self._pick_target()
+        with self._lock:
+            self._in_flight[target] += 1
+        try:
+            return self._send(request, target)
+        except grpc.RpcError as exc:
+            log(f"[scheduler] worker {target} failed, trying others: {exc.code()} {exc.details()}")
+            with self._lock:
+                self._in_flight[target] -= 1
+            last_error: Exception = exc
+            for fallback in self._fallback_order(exclude=target):
+                with self._lock:
+                    self._in_flight[fallback] += 1
+                try:
+                    return self._send(request, fallback)
+                except grpc.RpcError as exc2:
+                    log(f"[scheduler] worker {fallback} failed, trying next: {exc2.code()} {exc2.details()}")
+                    with self._lock:
+                        self._in_flight[fallback] -= 1
+                    last_error = exc2
+                    continue
             raise RuntimeError(f"all remote workers failed: {last_error}") from last_error
-        raise RuntimeError("all remote workers failed")
+
+    def _send(self, request: mineru_pb2.ParsePdfRequest, target: str) -> mineru_pb2.ParsePdfResponse:
+        try:
+            with grpc.insecure_channel(
+                target,
+                options=[
+                    ("grpc.max_receive_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+                    ("grpc.max_send_message_length", DEFAULT_MAX_MESSAGE_BYTES),
+                    ("grpc.keepalive_time_ms", DEFAULT_KEEPALIVE_TIME_MS),
+                    ("grpc.keepalive_timeout_ms", DEFAULT_KEEPALIVE_TIMEOUT_MS),
+                    ("grpc.keepalive_permit_without_calls", int(DEFAULT_KEEPALIVE_PERMIT_WITHOUT_CALLS)),
+                    ("grpc.http2.max_pings_without_data", DEFAULT_HTTP2_MAX_PINGS_WITHOUT_DATA),
+                ],
+            ) as channel:
+                stub = mineru_pb2_grpc.MineruPdfExtractorStub(channel)
+                return stub.ParsePdf(request, timeout=DEFAULT_REMOTE_TIMEOUT_SECONDS)
+        finally:
+            with self._lock:
+                self._in_flight[target] -= 1
 
 
 class MineruService(mineru_pb2_grpc.MineruPdfExtractorServicer):

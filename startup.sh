@@ -72,7 +72,7 @@ setup_venv() {
     "${MINERU_PYTHON_BIN}" -m pip install mineru
 
     # gRPC and PDF deps: upgrade is safe because they're independent of MinerU's ML stack.
-    "${MINERU_PYTHON_BIN}" -m pip install -U grpcio grpcio-tools pymupdf
+    "${MINERU_PYTHON_BIN}" -m pip install -U grpcio grpcio-tools pymupdf psutil
   fi
 }
 
