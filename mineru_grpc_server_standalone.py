@@ -1062,11 +1062,6 @@ class WorkerManager:
         self._ready_lock = threading.Lock()
         self._result_thread: threading.Thread | None = None
         self._closed = False
-        # Coordinated recycle: collect all recycle signals before restarting any
-        # worker, so all old processes exit and release memory before new ones
-        # start loading models.
-        self._recycle_pending: set[int] = set()
-        self._recycle_lock = threading.Lock()
 
     def start(self) -> None:
         if self.processes:
@@ -1124,25 +1119,12 @@ class WorkerManager:
 
             if msg_type == "recycle":
                 wid = int(message.get("worker_id", -1))
-                with self._recycle_lock:
-                    self._recycle_pending.add(wid)
-                    all_ready = len(self._recycle_pending) >= self.worker_count
-                    if all_ready:
-                        workers_to_restart = list(self._recycle_pending)
-                        self._recycle_pending.clear()
-                if all_ready:
-                    # All workers hit their quota. Restart them all together so
-                    # old processes can exit and free memory before new ones start
-                    # loading models.
-                    log(f"[worker] all {self.worker_count} workers reached quota, coordinated restart")
-                    threading.Thread(
-                        target=self._recycle_all_workers,
-                        args=(workers_to_restart,),
-                        daemon=True,
-                        name="mineru-recycle-all",
-                    ).start()
-                else:
-                    log(f"[worker] worker {wid} reached quota, waiting for others ({len(self._recycle_pending)}/{self.worker_count})")
+                threading.Thread(
+                    target=self._recycle_worker,
+                    args=(wid,),
+                    daemon=True,
+                    name=f"mineru-recycle-{wid}",
+                ).start()
                 continue
 
             if msg_type not in {"result", "error"}:
@@ -1155,59 +1137,6 @@ class WorkerManager:
                 waiter = self._pending.pop(task_id, None)
             if waiter is not None:
                 waiter.put(message)
-
-    def _recycle_all_workers(self, worker_ids: list[int]) -> None:
-        """Stop all old worker processes first, then start all new ones together."""
-        if self._closed:
-            return
-
-        # Phase 1: wait for all old processes to exit so memory is freed before
-        # any new process starts loading the model.
-        for wid in worker_ids:
-            old = self.processes.get(wid)
-            if old is not None and old.is_alive():
-                old.join(timeout=10)
-                if old.is_alive():
-                    old.terminate()
-                    old.join(timeout=3)
-
-        if self._closed:
-            return
-
-        log(f"[worker] all old workers exited, starting {len(worker_ids)} fresh workers")
-
-        # Phase 2: register ready-waiters for all workers before spawning any,
-        # so no "ready" message can be missed.
-        ready_waiters: dict[int, queue.Queue] = {}
-        with self._ready_lock:
-            for wid in worker_ids:
-                w: queue.Queue = queue.Queue(maxsize=1)
-                self._ready_waiters[wid] = w
-                ready_waiters[wid] = w
-
-        # Phase 3: spawn all new processes simultaneously.
-        for wid in worker_ids:
-            process = mp.Process(
-                target=worker_process_main,
-                args=(wid, self.task_queue, self.result_queue),
-                name=f"mineru-worker-{wid}",
-            )
-            process.start()
-            self.processes[wid] = process
-
-        # Phase 4: wait for each to finish prewarm.
-        for wid in worker_ids:
-            try:
-                msg = ready_waiters[wid].get(timeout=600)
-                if msg.get("type") == "ready":
-                    log(f"[worker] worker {wid} recycled and ready")
-                else:
-                    log(f"[worker] worker {wid} unexpected message after recycle: {msg}")
-            except queue.Empty:
-                log(f"[worker] worker {wid} timed out waiting for ready after recycle")
-            finally:
-                with self._ready_lock:
-                    self._ready_waiters.pop(wid, None)
 
     def _recycle_worker(self, worker_id: int) -> None:
         if self._closed:
