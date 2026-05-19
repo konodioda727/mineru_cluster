@@ -144,6 +144,10 @@ DEFAULT_PREWARM_ENABLED = (os.getenv("MINERU_SERVER_PREWARM") or "true").strip()
     "yes",
     "on",
 }
+# After this many tasks a worker exits and is automatically restarted, freeing any
+# memory that ML runtimes (PaddleOCR, PyTorch, etc.) accumulate across calls.
+# 0 disables recycling (legacy behaviour — workers run forever).
+DEFAULT_MAX_TASKS_PER_WORKER = int(os.getenv("MINERU_SERVER_MAX_TASKS_PER_WORKER", "20"))
 DEFAULT_PREWARM_METHOD = (os.getenv("MINERU_SERVER_PREWARM_METHOD") or "ocr").strip().lower()
 DEFAULT_PREWARM_LANG = (os.getenv("MINERU_SERVER_PREWARM_LANG") or DEFAULT_LANG).strip()
 DEFAULT_LOG_MODE = (os.getenv("MINERU_SERVER_LOG_MODE") or "concise").strip().lower()
@@ -938,17 +942,30 @@ def run_startup_prewarm() -> None:
         shutil.rmtree(warmup_dir, ignore_errors=True)
 
 
+def _try_empty_torch_cache() -> None:
+    try:
+        import torch
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def worker_process_main(
     worker_id: int,
     task_queue: mp.Queue,
     result_queue: mp.Queue,
 ) -> None:
+    import gc
     try:
         configure_logging()
         configure_mineru_runtime_env()
         run_startup_prewarm()
         result_queue.put({"type": "ready", "worker_id": worker_id})
 
+        tasks_processed = 0
         while True:
             task = task_queue.get()
             if task is None:
@@ -957,12 +974,18 @@ def worker_process_main(
             task_id = str(task["task_id"])
             filename = str(task["filename"])
             profile = task["profile"]
+            # Extract bytes and drop the dict reference so the large PDF payload
+            # can be GC'd as soon as process_pdf_request writes it to disk.
+            file_content = task["file_content"]
+            del task
+
             try:
                 response_bytes = process_pdf_request(
                     filename,
-                    task["file_content"],
+                    file_content,
                     profile,
                 )
+                del file_content
                 result_queue.put(
                     {
                         "type": "result",
@@ -971,6 +994,7 @@ def worker_process_main(
                         "response_bytes": response_bytes,
                     }
                 )
+                del response_bytes
                 log_event("completed", task_id=task_id, worker_id=worker_id, filename=filename)
             except Exception as exc:
                 result_queue.put(
@@ -982,6 +1006,15 @@ def worker_process_main(
                     }
                 )
                 log_event("failed", task_id=task_id, worker_id=worker_id, filename=filename, detail=str(exc))
+
+            gc.collect()
+            _try_empty_torch_cache()
+
+            tasks_processed += 1
+            if DEFAULT_MAX_TASKS_PER_WORKER > 0 and tasks_processed >= DEFAULT_MAX_TASKS_PER_WORKER:
+                log_event("recycling", worker_id=worker_id, detail=f"after {tasks_processed} tasks")
+                result_queue.put({"type": "recycle", "worker_id": worker_id})
+                return
     except Exception as exc:
         result_queue.put(
             {
@@ -998,9 +1031,15 @@ class WorkerManager:
         self.worker_count = max(1, worker_count)
         self.task_queue: mp.Queue = mp.Queue()
         self.result_queue: mp.Queue = mp.Queue()
-        self.processes: list[mp.Process] = []
+        # Keyed by worker_id so we can replace individual workers on recycle.
+        self.processes: dict[int, mp.Process] = {}
         self._pending: dict[str, queue.Queue] = {}
         self._pending_lock = threading.Lock()
+        # During a recycle the respawned worker sends a "ready" message.
+        # _result_loop routes it to the matching waiter here instead of
+        # blocking result delivery for other tasks.
+        self._ready_waiters: dict[int, queue.Queue] = {}
+        self._ready_lock = threading.Lock()
         self._result_thread: threading.Thread | None = None
         self._closed = False
 
@@ -1008,6 +1047,8 @@ class WorkerManager:
         if self.processes:
             return
 
+        # _result_loop has not started yet so we can safely call result_queue.get()
+        # directly here to wait for each worker's initial "ready" signal.
         for worker_id in range(self.worker_count):
             process = mp.Process(
                 target=worker_process_main,
@@ -1022,7 +1063,7 @@ class WorkerManager:
                     f"worker {worker_id} failed during startup: {message.get('error') or message}"
                 )
             log(f"[startup] worker {worker_id} ready")
-            self.processes.append(process)
+            self.processes[worker_id] = process
 
         self._result_thread = threading.Thread(
             target=self._result_loop,
@@ -1044,7 +1085,31 @@ class WorkerManager:
 
             if not isinstance(message, dict):
                 continue
-            if message.get("type") not in {"result", "error"}:
+
+            msg_type = message.get("type")
+
+            if msg_type == "ready":
+                # A recycled worker finished its prewarm and is ready again.
+                wid = int(message.get("worker_id", -1))
+                with self._ready_lock:
+                    waiter = self._ready_waiters.get(wid)
+                if waiter is not None:
+                    waiter.put(message)
+                continue
+
+            if msg_type == "recycle":
+                # Worker has processed its quota; respawn it in a background thread
+                # so we don't stall result delivery for other workers.
+                wid = int(message.get("worker_id", -1))
+                threading.Thread(
+                    target=self._recycle_worker,
+                    args=(wid,),
+                    daemon=True,
+                    name=f"mineru-recycle-{wid}",
+                ).start()
+                continue
+
+            if msg_type not in {"result", "error"}:
                 continue
 
             task_id = str(message.get("task_id") or "")
@@ -1054,6 +1119,46 @@ class WorkerManager:
                 waiter = self._pending.pop(task_id, None)
             if waiter is not None:
                 waiter.put(message)
+
+    def _recycle_worker(self, worker_id: int) -> None:
+        if self._closed:
+            return
+        ready_waiter: queue.Queue = queue.Queue(maxsize=1)
+        with self._ready_lock:
+            self._ready_waiters[worker_id] = ready_waiter
+        try:
+            old = self.processes.get(worker_id)
+            if old is not None:
+                old.join(timeout=5)
+                if old.is_alive():
+                    old.terminate()
+                    old.join(timeout=2)
+
+            if self._closed:
+                return
+
+            process = mp.Process(
+                target=worker_process_main,
+                args=(worker_id, self.task_queue, self.result_queue),
+                name=f"mineru-worker-{worker_id}",
+            )
+            process.start()
+            self.processes[worker_id] = process
+
+            # Wait for the new process to finish its prewarm (up to 10 min).
+            try:
+                msg = ready_waiter.get(timeout=600)
+                if msg.get("type") == "ready":
+                    log(f"[worker] worker {worker_id} recycled and ready")
+                else:
+                    log(f"[worker] worker {worker_id} unexpected message after recycle: {msg}")
+            except queue.Empty:
+                log(f"[worker] worker {worker_id} timed out waiting for ready after recycle")
+        except Exception as exc:
+            log(f"[worker] worker {worker_id} recycle failed: {exc}")
+        finally:
+            with self._ready_lock:
+                self._ready_waiters.pop(worker_id, None)
 
     def submit(
         self,
@@ -1094,7 +1199,7 @@ class WorkerManager:
         self._closed = True
         for _ in self.processes:
             self.task_queue.put(None)
-        for process in self.processes:
+        for process in self.processes.values():
             process.join(timeout=5)
             if process.is_alive():
                 process.terminate()
@@ -1232,6 +1337,14 @@ def serve() -> None:
         server,
     )
     server.add_insecure_port(f"[::]:{DEFAULT_PORT}")
+    if not is_scheduler_role() and DEFAULT_REQUEST_CONCURRENCY < DEFAULT_WORKER_PROCESSES:
+        log(
+            f"[main] WARNING: MINERU_SERVER_REQUEST_CONCURRENCY ({DEFAULT_REQUEST_CONCURRENCY}) "
+            f"< MINERU_SERVER_WORKER_PROCESSES ({DEFAULT_WORKER_PROCESSES}). "
+            f"{DEFAULT_WORKER_PROCESSES - DEFAULT_REQUEST_CONCURRENCY} worker(s) will be permanently idle. "
+            f"Remove MINERU_SERVER_REQUEST_CONCURRENCY from your env to let it auto-match WORKER_PROCESSES."
+        )
+
     log(
         f"[main] MinerU gRPC server listening on :{DEFAULT_PORT} "
         f"(chunk_size={'auto' if resolve_optional_chunk_size() is None else resolve_optional_chunk_size()}, "
@@ -1239,6 +1352,7 @@ def serve() -> None:
         f"max_workers={DEFAULT_MAX_WORKERS}, backend={DEFAULT_BACKEND}, method={DEFAULT_METHOD}, "
         f"execution_mode={'python' if is_in_process_pipeline_enabled() else 'cli'}, "
         f"worker_processes={max(1, DEFAULT_WORKER_PROCESSES)}, "
+        f"max_tasks_per_worker={DEFAULT_MAX_TASKS_PER_WORKER or 'unlimited'}, "
         f"remote_workers={len(DEFAULT_REMOTE_WORKERS)}, "
         f"device={DEFAULT_DEVICE}, formula_enable={DEFAULT_FORMULA_ENABLE}, "
         f"table_enable={DEFAULT_TABLE_ENABLE}, table_merge_enable={DEFAULT_TABLE_MERGE_ENABLE}, "
