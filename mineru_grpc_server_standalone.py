@@ -957,27 +957,45 @@ def _try_empty_torch_cache() -> None:
 
 
 def _worker_rss_gb() -> float:
-    # CPU-side RSS
+    if sys.platform == "darwin":
+        return _macos_phys_footprint_gb()
+    # Linux: read RSS from /proc/self/status (in kB)
     try:
-        import psutil
-        rss_bytes = psutil.Process().memory_info().rss
-    except Exception:
-        import resource
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss_bytes = usage.ru_maxrss if sys.platform != "darwin" else usage.ru_maxrss
-        if sys.platform != "darwin":
-            rss_bytes *= 1024  # Linux: KB → bytes
-    rss_gb = rss_bytes / (1024 ** 3)
-
-    # MPS GPU-side memory (unified memory, not visible to ru_maxrss)
-    try:
-        import torch
-        if hasattr(torch, "mps") and torch.backends.mps.is_available():
-            rss_gb += torch.mps.current_allocated_memory() / (1024 ** 3)
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024 ** 2)
     except Exception:
         pass
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)
 
-    return rss_gb
+
+def _macos_phys_footprint_gb() -> float:
+    """Read ri_phys_footprint via proc_pid_rusage — same metric Activity Monitor uses.
+    Includes CPU heap, Metal/MPS GPU buffers, and IOKit allocations."""
+    import ctypes
+    import ctypes.util
+
+    class _RUsageInfo(ctypes.Structure):
+        _fields_ = [
+            ("ri_uuid",             ctypes.c_uint8 * 16),
+            ("ri_user_time",        ctypes.c_uint64),
+            ("ri_system_time",      ctypes.c_uint64),
+            ("ri_pkg_idle_wkups",   ctypes.c_uint64),
+            ("ri_interrupt_wkups",  ctypes.c_uint64),
+            ("ri_pageins",          ctypes.c_uint64),
+            ("ri_wired_size",       ctypes.c_uint64),
+            ("ri_resident_size",    ctypes.c_uint64),
+            ("ri_phys_footprint",   ctypes.c_uint64),
+        ]
+
+    libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+    info = _RUsageInfo()
+    ret = libproc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(info))
+    if ret != 0:
+        raise OSError(f"proc_pid_rusage failed with code {ret}")
+    return info.ri_phys_footprint / (1024 ** 3)
 
 
 def worker_process_main(
