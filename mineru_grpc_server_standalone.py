@@ -1016,29 +1016,40 @@ def _worker_rss_gb() -> float:
 
 def _macos_phys_footprint_gb() -> float:
     """Read ri_phys_footprint via proc_pid_rusage — same metric Activity Monitor uses.
-    Includes CPU heap, Metal/MPS GPU buffers, and IOKit allocations."""
+    Includes CPU heap, Metal/MPS GPU buffers, and IOKit allocations.
+
+    IMPORTANT: Do NOT define a ctypes.Structure with only the fields you need.
+    rusage_info_v4 has 36+ uint64 fields (304 bytes total). A partial struct
+    of 80 bytes causes the kernel to overwrite 224 bytes of Python heap memory,
+    corrupting pymalloc metadata and causing random SIGSEGV crashes later.
+
+    Instead, allocate a 1024-byte opaque buffer. ri_phys_footprint has been at
+    byte offset 72 since rusage_info_v0 and all later versions only append
+    fields at the end, so the offset is stable across all macOS versions.
+
+    Offset breakdown:
+      ri_uuid[16]          =  16 bytes  (offset   0)
+      ri_user_time         =   8 bytes  (offset  16)
+      ri_system_time       =   8 bytes  (offset  24)
+      ri_pkg_idle_wkups    =   8 bytes  (offset  32)
+      ri_interrupt_wkups   =   8 bytes  (offset  40)
+      ri_pageins           =   8 bytes  (offset  48)
+      ri_wired_size        =   8 bytes  (offset  56)
+      ri_resident_size     =   8 bytes  (offset  64)
+      ri_phys_footprint    =   8 bytes  (offset  72)  ← what we read
+    """
     import ctypes
     import ctypes.util
-
-    class _RUsageInfo(ctypes.Structure):
-        _fields_ = [
-            ("ri_uuid",             ctypes.c_uint8 * 16),
-            ("ri_user_time",        ctypes.c_uint64),
-            ("ri_system_time",      ctypes.c_uint64),
-            ("ri_pkg_idle_wkups",   ctypes.c_uint64),
-            ("ri_interrupt_wkups",  ctypes.c_uint64),
-            ("ri_pageins",          ctypes.c_uint64),
-            ("ri_wired_size",       ctypes.c_uint64),
-            ("ri_resident_size",    ctypes.c_uint64),
-            ("ri_phys_footprint",   ctypes.c_uint64),
-        ]
+    import struct
 
     libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
-    info = _RUsageInfo()
-    ret = libproc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(info))
+    # 1024 bytes is safely larger than any known rusage_info_vN struct.
+    buf = ctypes.create_string_buffer(1024)
+    ret = libproc.proc_pid_rusage(os.getpid(), 4, buf)
     if ret != 0:
         raise OSError(f"proc_pid_rusage returned {ret}")
-    return info.ri_phys_footprint / (1024 ** 3)
+    (phys_footprint,) = struct.unpack_from("<Q", buf, 72)
+    return phys_footprint / (1024 ** 3)
 
 
 def worker_process_main(
@@ -1046,10 +1057,6 @@ def worker_process_main(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
 ) -> None:
-    # Create a new process group so that when the manager kills this worker,
-    # it can kill the entire group (including any subprocesses MinerU spawns
-    # during inference) with a single os.killpg() call.
-    os.setsid()
     try:
         configure_logging()
         configure_mineru_runtime_env()
@@ -1070,6 +1077,11 @@ def worker_process_main(
             # can be GC'd as soon as process_pdf_request writes it to disk.
             file_content = task["file_content"]
             del task
+
+            # Notify manager which task we are starting. If this process crashes
+            # mid-task, the manager uses this to fail the stuck waiter so the
+            # gRPC handler thread is unblocked and _request_slots is released.
+            result_queue.put({"type": "started", "worker_id": worker_id, "task_id": task_id})
 
             try:
                 response_bytes = process_pdf_request(
@@ -1134,6 +1146,44 @@ def worker_process_main(
         raise
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants, regardless of process group.
+
+    os.killpg() misses processes that escaped the group (e.g. Python's
+    resource-tracker, or libraries that call setsid() internally).
+    psutil walks the PID parent→child tree which is immune to that.
+    """
+    try:
+        import psutil
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+    except Exception:
+        # psutil unavailable or process already gone — fall back to direct kill.
+        try:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        return
+
+    # Kill leaves first so no child can re-spawn before parent dies.
+    for child in reversed(children):
+        try:
+            child.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    try:
+        parent.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+    # Reap to avoid zombies.
+    try:
+        psutil.wait_procs(children + [parent], timeout=3)
+    except Exception:
+        pass
+
+
 class WorkerManager:
     def __init__(self, worker_count: int) -> None:
         self.worker_count = max(1, worker_count)
@@ -1151,6 +1201,11 @@ class WorkerManager:
         # Track which workers are currently being recycled to avoid duplicate restarts.
         self._recycling: set[int] = set()
         self._recycling_lock = threading.Lock()
+        # Track which task each worker is currently processing.
+        # When a worker crashes mid-task, we use this to fail the stuck waiter
+        # so the gRPC handler thread is unblocked and _request_slots is released.
+        self._worker_current_task: dict[int, str] = {}
+        self._worker_task_lock = threading.Lock()
         self._result_thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
         self._closed = False
@@ -1216,6 +1271,14 @@ class WorkerManager:
                     waiter.put(message)
                 continue
 
+            if msg_type == "started":
+                wid = int(message.get("worker_id", -1))
+                task_id = str(message.get("task_id") or "")
+                if wid >= 0 and task_id:
+                    with self._worker_task_lock:
+                        self._worker_current_task[wid] = task_id
+                continue
+
             if msg_type == "recycle":
                 wid = int(message.get("worker_id", -1))
                 self._trigger_recycle(wid, reason="worker requested")
@@ -1227,6 +1290,9 @@ class WorkerManager:
             task_id = str(message.get("task_id") or "")
             if not task_id:
                 continue
+            wid = int(message.get("worker_id", -1))
+            with self._worker_task_lock:
+                self._worker_current_task.pop(wid, None)
             with self._pending_lock:
                 waiter = self._pending.pop(task_id, None)
             if waiter is not None:
@@ -1264,20 +1330,32 @@ class WorkerManager:
         with self._ready_lock:
             self._ready_waiters[worker_id] = ready_waiter
         log(f"[worker] recycling worker {worker_id}" + (f" ({reason})" if reason else ""))
+        # If this worker crashed mid-task, fail the stuck waiter immediately so
+        # the gRPC handler thread is unblocked and _request_slots is released.
+        with self._worker_task_lock:
+            lost_task_id = self._worker_current_task.pop(worker_id, None)
+        if lost_task_id:
+            with self._pending_lock:
+                waiter = self._pending.pop(lost_task_id, None)
+            if waiter:
+                log(f"[worker] worker {worker_id} crashed mid-task, failing task {lost_task_id}")
+                waiter.put({"type": "error", "task_id": lost_task_id, "error": f"worker {worker_id} crashed mid-task"})
         try:
             old = self.processes.get(worker_id)
             if old is not None:
-                # Kill the entire process group, not just the worker process.
-                # MinerU spawns helper subprocesses during inference; they share
-                # the worker's process group (set via os.setsid() at startup).
-                # SIGKILL also skips Python's normal shutdown GC pass, which
-                # races with onnxruntime's C++ thread pool → SIGSEGV.
+                # Kill the entire process tree rooted at the worker, not just
+                # the worker itself. os.killpg() is insufficient because:
+                #  1. Python's mp.Queue unpickling starts a resource-tracker
+                #     process before os.setsid() runs, leaving it in the
+                #     original process group.
+                #  2. Libraries like PaddlePaddle may fork() and call setsid()
+                #     internally, escaping our process group entirely.
+                # psutil walks the PID parent→child tree regardless of process
+                # groups, so it catches every descendant no matter how it was
+                # spawned. SIGKILL also skips Python's shutdown GC pass which
+                # races with onnxruntime threads → SIGSEGV.
                 if old.is_alive():
-                    try:
-                        import signal
-                        os.killpg(os.getpgid(old.pid), signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        old.kill()  # fallback if pgid lookup fails
+                    _kill_process_tree(old.pid)
                 old.join(timeout=5)
 
             if self._closed:
