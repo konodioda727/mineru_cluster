@@ -8,6 +8,37 @@ Requirements in the same directory:
 
 from __future__ import annotations
 
+import os
+import sys as _sys
+
+# ── macOS subprocess stability ────────────────────────────────────────────────
+# Must be set before ANY import of ObjC-backed frameworks (Metal, PyTorch, Paddle).
+# With multiprocessing spawn, child processes re-run module-level code, so these
+# env vars are inherited by workers before ML frameworks are loaded.
+#
+# OBJC_DISABLE_INITIALIZE_FORK_SAFETY: Apple's ObjC runtime guards against being
+#   used between fork() and exec(). Even with spawn, Python's multiprocessing has
+#   a brief fork step on macOS that trips this guard → silent SIGABRT worker crash.
+# OMP_NUM_THREADS=1: PyTorch and PaddlePaddle both bundle libomp. Multiple
+#   subprocesses each initialising their own OpenMP runtimes causes libomp to
+#   SEGFAULT (confirmed pytorch#161865 on M4 Max, same on M2 Ultra).
+# PYTORCH_ENABLE_MPS_FALLBACK: ops not yet implemented on MPS fall back to CPU
+#   instead of raising an error or crashing the Metal command encoder.
+# no_proxy=*: macOS _scproxy.so (called by urllib at import time) is not
+#   fork-safe; setting no_proxy prevents it from being invoked in child processes.
+if _sys.platform == "darwin":
+    os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    os.environ.setdefault("no_proxy", "*")
+
+# ── gRPC fork support ─────────────────────────────────────────────────────────
+# Must be set before grpc is imported, otherwise gRPC ignores them.
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
+# epoll is Linux-only; on macOS use poll to avoid FD-from-fork warnings.
+if _sys.platform != "darwin":
+    os.environ.setdefault("GRPC_POLL_STRATEGY", "epoll1")
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
@@ -1063,7 +1094,6 @@ def worker_process_main(
                 log_event("recycling", worker_id=worker_id, detail=f"memory limit reached: {rss_gb:.1f}GB >= {DEFAULT_MAX_WORKER_MEMORY_GB}GB")
                 result_queue.put({"type": "recycle", "worker_id": worker_id})
                 return
-            tasks_processed += 1
             if DEFAULT_MAX_TASKS_PER_WORKER > 0 and tasks_processed >= DEFAULT_MAX_TASKS_PER_WORKER:
                 log_event("recycling", worker_id=worker_id, detail=f"after {tasks_processed} tasks, rss={rss_gb:.1f}GB")
                 result_queue.put({"type": "recycle", "worker_id": worker_id})
@@ -1093,7 +1123,11 @@ class WorkerManager:
         # blocking result delivery for other tasks.
         self._ready_waiters: dict[int, queue.Queue] = {}
         self._ready_lock = threading.Lock()
+        # Track which workers are currently being recycled to avoid duplicate restarts.
+        self._recycling: set[int] = set()
+        self._recycling_lock = threading.Lock()
         self._result_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._closed = False
 
     def start(self) -> None:
@@ -1125,6 +1159,13 @@ class WorkerManager:
         )
         self._result_thread.start()
 
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="mineru-worker-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
     def _result_loop(self) -> None:
         while not self._closed:
             try:
@@ -1152,12 +1193,7 @@ class WorkerManager:
 
             if msg_type == "recycle":
                 wid = int(message.get("worker_id", -1))
-                threading.Thread(
-                    target=self._recycle_worker,
-                    args=(wid,),
-                    daemon=True,
-                    name=f"mineru-recycle-{wid}",
-                ).start()
+                self._trigger_recycle(wid, reason="worker requested")
                 continue
 
             if msg_type not in {"result", "error"}:
@@ -1171,12 +1207,38 @@ class WorkerManager:
             if waiter is not None:
                 waiter.put(message)
 
-    def _recycle_worker(self, worker_id: int) -> None:
+    def _trigger_recycle(self, worker_id: int, reason: str = "") -> None:
+        with self._recycling_lock:
+            if worker_id in self._recycling:
+                return
+            self._recycling.add(worker_id)
+        threading.Thread(
+            target=self._recycle_worker,
+            args=(worker_id, reason),
+            daemon=True,
+            name=f"mineru-recycle-{worker_id}",
+        ).start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._closed:
+            time.sleep(5)
+            if self._closed:
+                return
+            for worker_id, process in list(self.processes.items()):
+                if not process.is_alive():
+                    with self._recycling_lock:
+                        already = worker_id in self._recycling
+                    if not already:
+                        log(f"[watchdog] worker {worker_id} died unexpectedly (exitcode={process.exitcode}), restarting")
+                        self._trigger_recycle(worker_id, reason=f"crashed exitcode={process.exitcode}")
+
+    def _recycle_worker(self, worker_id: int, reason: str = "") -> None:
         if self._closed:
             return
         ready_waiter: queue.Queue = queue.Queue(maxsize=1)
         with self._ready_lock:
             self._ready_waiters[worker_id] = ready_waiter
+        log(f"[worker] recycling worker {worker_id}" + (f" ({reason})" if reason else ""))
         try:
             old = self.processes.get(worker_id)
             if old is not None:
@@ -1210,6 +1272,8 @@ class WorkerManager:
         finally:
             with self._ready_lock:
                 self._ready_waiters.pop(worker_id, None)
+            with self._recycling_lock:
+                self._recycling.discard(worker_id)
 
     def submit(
         self,
