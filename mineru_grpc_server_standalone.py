@@ -1046,14 +1046,10 @@ def worker_process_main(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
 ) -> None:
-    import gc
-    # Disable Python's cyclic GC to prevent it from racing with onnxruntime's
-    # internal C++ thread pool. The crash signature is:
-    #   gc_collect_main → deduce_unreachable → SIGSEGV on a freed C++ object
-    # onnxruntime allocates/frees C++ objects from its own threads; Python's GC
-    # then follows the (now-invalid) pointer stored in the Python wrapper object.
-    # We call gc.collect() manually after each task so objects are still reclaimed.
-    gc.disable()
+    # Create a new process group so that when the manager kills this worker,
+    # it can kill the entire group (including any subprocesses MinerU spawns
+    # during inference) with a single os.killpg() call.
+    os.setsid()
     try:
         configure_logging()
         configure_mineru_runtime_env()
@@ -1103,7 +1099,12 @@ def worker_process_main(
                 )
                 log_event("failed", task_id=task_id, worker_id=worker_id, filename=filename, detail=str(exc))
 
-            gc.collect()
+            # Do NOT call gc.collect() here. onnxruntime keeps a persistent C++
+            # thread pool alive for the entire process lifetime. Python's GC
+            # (both automatic and manual gc.collect()) can race with those threads
+            # and follow a pointer to a C++ object that onnxruntime has already
+            # freed internally → deduce_unreachable → SIGSEGV. We rely on worker
+            # recycling (process exit) to reclaim memory instead.
             _try_empty_torch_cache()
 
             tasks_processed += 1
@@ -1266,10 +1267,18 @@ class WorkerManager:
         try:
             old = self.processes.get(worker_id)
             if old is not None:
-                old.join(timeout=5)
+                # Kill the entire process group, not just the worker process.
+                # MinerU spawns helper subprocesses during inference; they share
+                # the worker's process group (set via os.setsid() at startup).
+                # SIGKILL also skips Python's normal shutdown GC pass, which
+                # races with onnxruntime's C++ thread pool → SIGSEGV.
                 if old.is_alive():
-                    old.terminate()
-                    old.join(timeout=2)
+                    try:
+                        import signal
+                        os.killpg(os.getpgid(old.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        old.kill()  # fallback if pgid lookup fails
+                old.join(timeout=5)
 
             if self._closed:
                 return
