@@ -28,9 +28,26 @@ import sys as _sys
 #   fork-safe; setting no_proxy prevents it from being invoked in child processes.
 if _sys.platform == "darwin":
     os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     os.environ.setdefault("no_proxy", "*")
+
+# Limit onnxruntime / OpenMP thread counts.
+# Each worker subprocess spawns its own onnxruntime thread pool. With N workers
+# the default (one thread per CPU core) creates N×core_count threads total,
+# which saturates the CPU scheduler and makes GC-vs-C++-thread races more
+# likely. Cap to a sane number; MinerU's workload is not embarrassingly parallel
+# at the intra-op level so more threads past ~4 gives diminishing returns.
+_ort_threads = os.getenv("OMP_NUM_THREADS") or os.getenv("MKL_NUM_THREADS")
+if not _ort_threads:
+    import multiprocessing as _mp
+    _cpu = _mp.cpu_count()
+    # Leave room for other processes; 4 is enough for onnxruntime intra-op.
+    _cap = max(1, min(4, _cpu // 4))
+    os.environ.setdefault("OMP_NUM_THREADS", str(_cap))
+    os.environ.setdefault("MKL_NUM_THREADS", str(_cap))
+    os.environ.setdefault("ORT_NUM_THREADS", str(_cap))
+    del _cap, _cpu
+del _ort_threads
 
 # ── gRPC fork support ─────────────────────────────────────────────────────────
 # Must be set before grpc is imported, otherwise gRPC ignores them.
@@ -1030,6 +1047,13 @@ def worker_process_main(
     result_queue: mp.Queue,
 ) -> None:
     import gc
+    # Disable Python's cyclic GC to prevent it from racing with onnxruntime's
+    # internal C++ thread pool. The crash signature is:
+    #   gc_collect_main → deduce_unreachable → SIGSEGV on a freed C++ object
+    # onnxruntime allocates/frees C++ objects from its own threads; Python's GC
+    # then follows the (now-invalid) pointer stored in the Python wrapper object.
+    # We call gc.collect() manually after each task so objects are still reclaimed.
+    gc.disable()
     try:
         configure_logging()
         configure_mineru_runtime_env()
