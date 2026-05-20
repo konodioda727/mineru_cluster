@@ -1262,8 +1262,12 @@ class WorkerManager:
 
             msg_type = message.get("type")
 
-            if msg_type == "ready":
-                # A recycled worker finished its prewarm and is ready again.
+            if msg_type in ("ready", "startup_error"):
+                # Route both success and failure back to whoever is waiting for
+                # this worker to finish its prewarm (either initial startup or
+                # after a recycle). startup_error previously fell through to the
+                # "not in {result,error}" branch and was silently dropped, leaving
+                # _recycle_worker blocked for 600 s with no retry.
                 wid = int(message.get("worker_id", -1))
                 with self._ready_lock:
                     waiter = self._ready_waiters.get(wid)
@@ -1326,12 +1330,9 @@ class WorkerManager:
     def _recycle_worker(self, worker_id: int, reason: str = "") -> None:
         if self._closed:
             return
-        ready_waiter: queue.Queue = queue.Queue(maxsize=1)
-        with self._ready_lock:
-            self._ready_waiters[worker_id] = ready_waiter
         log(f"[worker] recycling worker {worker_id}" + (f" ({reason})" if reason else ""))
-        # If this worker crashed mid-task, fail the stuck waiter immediately so
-        # the gRPC handler thread is unblocked and _request_slots is released.
+        # Fail any task this worker was processing so the gRPC handler thread
+        # is unblocked and _request_slots is released immediately.
         with self._worker_task_lock:
             lost_task_id = self._worker_current_task.pop(worker_id, None)
         if lost_task_id:
@@ -1343,43 +1344,63 @@ class WorkerManager:
         try:
             old = self.processes.get(worker_id)
             if old is not None:
-                # Kill the entire process tree rooted at the worker, not just
-                # the worker itself. os.killpg() is insufficient because:
-                #  1. Python's mp.Queue unpickling starts a resource-tracker
-                #     process before os.setsid() runs, leaving it in the
-                #     original process group.
-                #  2. Libraries like PaddlePaddle may fork() and call setsid()
-                #     internally, escaping our process group entirely.
-                # psutil walks the PID parent→child tree regardless of process
-                # groups, so it catches every descendant no matter how it was
-                # spawned. SIGKILL also skips Python's shutdown GC pass which
+                # Kill the entire process tree via psutil (not killpg) so that
+                # descendant processes that escaped the process group are also
+                # cleaned up. SIGKILL skips Python's shutdown GC pass which
                 # races with onnxruntime threads → SIGSEGV.
                 if old.is_alive():
                     _kill_process_tree(old.pid)
                 old.join(timeout=5)
 
-            if self._closed:
-                return
+            # Retry loop: on startup failure (network timeout, model download
+            # error, etc.) retry with exponential back-off instead of giving up.
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
+                if self._closed:
+                    return
 
-            process = mp.Process(
-                target=worker_process_main,
-                args=(worker_id, self.task_queue, self.result_queue),
-                name=f"mineru-worker-{worker_id}",
-            )
-            process.start()
-            self.processes[worker_id] = process
+                ready_waiter: queue.Queue = queue.Queue(maxsize=1)
+                with self._ready_lock:
+                    self._ready_waiters[worker_id] = ready_waiter
 
-            # Wait for the new process to finish its prewarm (up to 10 min).
-            try:
-                msg = ready_waiter.get(timeout=600)
-                if msg.get("type") == "ready":
-                    log(f"[worker] worker {worker_id} recycled and ready")
+                process = mp.Process(
+                    target=worker_process_main,
+                    args=(worker_id, self.task_queue, self.result_queue),
+                    name=f"mineru-worker-{worker_id}",
+                )
+                process.start()
+                self.processes[worker_id] = process
+                log(f"[worker] worker {worker_id} starting (attempt {attempt}/{max_attempts})")
+
+                try:
+                    msg = ready_waiter.get(timeout=600)
+                except queue.Empty:
+                    msg = None
+
+                with self._ready_lock:
+                    self._ready_waiters.pop(worker_id, None)
+
+                if msg is not None and msg.get("type") == "ready":
+                    log(f"[worker] worker {worker_id} ready")
+                    return
+
+                # Startup failed — kill the new process and decide whether to retry.
+                error = msg.get("error", "unknown") if msg else "prewarm timeout"
+                if attempt < max_attempts:
+                    delay = min(10 * attempt, 60)
+                    log(f"[worker] worker {worker_id} startup failed ({error}), retrying in {delay}s (attempt {attempt}/{max_attempts})")
+                    if process.is_alive():
+                        _kill_process_tree(process.pid)
+                    process.join(timeout=5)
+                    time.sleep(delay)
                 else:
-                    log(f"[worker] worker {worker_id} unexpected message after recycle: {msg}")
-            except queue.Empty:
-                log(f"[worker] worker {worker_id} timed out waiting for ready after recycle")
+                    log(f"[worker] worker {worker_id} startup failed after {max_attempts} attempts ({error}), giving up")
+                    if process.is_alive():
+                        _kill_process_tree(process.pid)
+                    process.join(timeout=5)
+
         except Exception as exc:
-            log(f"[worker] worker {worker_id} recycle failed: {exc}")
+            log(f"[worker] worker {worker_id} recycle error: {exc}")
         finally:
             with self._ready_lock:
                 self._ready_waiters.pop(worker_id, None)
