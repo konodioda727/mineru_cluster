@@ -887,6 +887,52 @@ def process_pdf_request(filename: str, file_content: bytes, profile: ParseProfil
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _run_pipeline(
+    output_dir: str,
+    pdf_file_names: list[str],
+    pdf_bytes_list: list[bytes],
+    lang_list: list[str],
+    profile: ParseProfile,
+    table_enable: bool,
+) -> None:
+    _process_pipeline(
+        output_dir=output_dir,
+        pdf_file_names=pdf_file_names,
+        pdf_bytes_list=pdf_bytes_list,
+        p_lang_list=lang_list,
+        parse_method=profile.method,
+        p_formula_enable=DEFAULT_FORMULA_ENABLE,
+        p_table_enable=table_enable,
+        f_draw_layout_bbox=False,
+        f_draw_span_bbox=False,
+        f_dump_md=False,
+        f_dump_middle_json=True,
+        f_dump_model_output=False,
+        f_dump_orig_pdf=False,
+        f_dump_content_list=True,
+        f_make_md_mode=MakeMode.MM_MD,
+    )
+
+
+def _is_table_indexing_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like MinerU's wireless-table numpy IndexError.
+
+    MinerU's wireless (borderless) table detector occasionally produces a 1-D
+    numpy array for edge-case tables (single row/column after cropping) but
+    indexes it as 2-D, raising IndexError with the message
+    'too many indices for array: array is 1-dimensional, but 2 were indexed'.
+    We check both the immediate exception and its cause chain so that even if
+    MinerU wraps it in a RuntimeError we still catch it.
+    """
+    needle = "too many indices for array"
+    node: BaseException | None = exc
+    while node is not None:
+        if needle in str(node):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
+
+
 def process_chunks_in_process(
     chunks: list[dict],
     output_dir: str,
@@ -900,23 +946,23 @@ def process_chunks_in_process(
     pdf_bytes_list = [Path(chunk["path"]).read_bytes() for chunk in chunks]
     lang_list = [profile.lang for _ in chunks]
 
-    _process_pipeline(
-        output_dir=output_dir,
-        pdf_file_names=pdf_file_names,
-        pdf_bytes_list=pdf_bytes_list,
-        p_lang_list=lang_list,
-        parse_method=profile.method,
-        p_formula_enable=DEFAULT_FORMULA_ENABLE,
-        p_table_enable=DEFAULT_TABLE_ENABLE,
-        f_draw_layout_bbox=False,
-        f_draw_span_bbox=False,
-        f_dump_md=False,
-        f_dump_middle_json=True,
-        f_dump_model_output=False,
-        f_dump_orig_pdf=False,
-        f_dump_content_list=True,
-        f_make_md_mode=MakeMode.MM_MD,
-    )
+    try:
+        _run_pipeline(output_dir, pdf_file_names, pdf_bytes_list, lang_list, profile, DEFAULT_TABLE_ENABLE)
+    except Exception as exc:
+        # MinerU's wireless-table detector has a known numpy IndexError on certain
+        # PDFs (edge-case tables that are 1-D after model prediction). When this
+        # happens, fall back to a table-disabled retry so the document is still
+        # extracted rather than failing entirely. The retry uses a fresh output
+        # directory to avoid partial files from the failed attempt confusing the
+        # pipeline.
+        if DEFAULT_TABLE_ENABLE and _is_table_indexing_error(exc):
+            log(f"[worker] table detection raised IndexError ({exc}); retrying without table detection")
+            # Clean up any partial output written before the crash.
+            for name in pdf_file_names:
+                shutil.rmtree(Path(output_dir) / name, ignore_errors=True)
+            _run_pipeline(output_dir, pdf_file_names, pdf_bytes_list, lang_list, profile, False)
+        else:
+            raise
 
     all_pages_data: dict[int, list[dict]] = {}
     for chunk in chunks:
